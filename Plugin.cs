@@ -53,13 +53,26 @@ public sealed class Plugin : IDalamudPlugin
     private DateTime  nextPeriodicCheck = DateTime.MinValue;
     private const float PlacementThreshold = 3f;
 
-    // ── Etat redirect Eos ─────────────────────────────────────────────────────
-    // Phase 1 : appel UAL direct depuis Framework.Update (hors hook, contexte propre).
-    // Phase 2 : si UAL echoue, ecriture memoire directe sur les offsets destination.
-    private bool      _pendingDirectUAL;    // tenter UAL au prochain tick
-    private DateTime? _pendingMemWriteAt;   // moment de l'ecriture memoire (fallback)
-    private uint      _eosOwner;            // EntityId du joueur (pour retrouver Eos)
-    private int       _memWriteRetry;       // nb de tentatives restantes (evite boucle infinie)
+    // ── Etat redirect Eos (Phase 1 : UAL direct ; Phase 2 : ecriture memoire) ─
+    private bool      _pendingDirectUAL;
+    private DateTime? _pendingMemWriteAt;
+    private uint      _eosOwner;
+    private int       _memWriteRetry;
+
+    // ── Redirect continu (Phase 3) ────────────────────────────────────────────
+    // Apres Dissipation, le serveur repousse Eos vers le joueur en continu
+    // (mode Heel). On ecrase la destination CHAQUE FRAME pendant jusqu'a
+    // ContinuousRedirectDuration secondes. Notre callback Framework.Update
+    // s'execute APRES les updates internes du jeu → notre ecriture est
+    // toujours la derniere du frame → Eos fait des progres net vers le centre.
+    private bool     _continuousRedirect;
+    private DateTime _continuousRedirectExpiry;
+    private const double ContinuousRedirectDuration = 10.0; // secondes max
+    // Mis a true quand "En attente" a ete envoye pour annuler le mode Heel.
+    // Dans ce cas, le prochain MemWrite passe outre le check speed==0.
+    private bool     _heelModeCancelPending;
+    // Dernier envoi de "En attente" — evite le spam (cooldown 25s).
+    private DateTime _lastStaySentAt = DateTime.MinValue;
 
     public Plugin()
     {
@@ -87,36 +100,40 @@ public sealed class Plugin : IDalamudPlugin
         ClientState.TerritoryChanged += OnTerritoryChanged;
         Framework.Update             += OnFrameworkUpdate;
 
+        // Rechercher l'action "Se placer" dans toutes les sheets Excel
+        SearchPetPlaceAction();
+
         Log.Information("[XIVSchAssitant] Charge — hooks UAL + UA actifs.");
     }
 
-    // ── Hook UseActionLocation (log seulement) ────────────────────────────────
+    // ── Hook UseActionLocation ────────────────────────────────────────────────
 
     private unsafe bool OnUseActionLocation(
         ActionManager* self, ActionType actionType, uint actionId,
         ulong targetObjectId, Vector3* location, uint param, byte a7)
     {
-        if ((byte)actionType == 11 && actionId == PlacePetActionId)
+        // Logger TOUS les appels type=11 pour diagnostiquer les actions de pet
+        if ((byte)actionType == 11)
         {
             var pos = location != null ? *location : Vector3.Zero;
             Log.Information(
-                $"[XIVSchAssitant] [UAL] type=11 id=3 " +
-                $"target=0x{targetObjectId:X8} pos=({pos.X:F2},{pos.Y:F2},{pos.Z:F2}) " +
-                $"param={param} a7={a7}");
+                $"[XIVSchAssitant] [UAL] type=11 id={actionId} " +
+                $"target=0x{targetObjectId:X8} pos=({pos.X:F2},{pos.Y:F2},{pos.Z:F2})");
         }
         return _ualHook!.Original(self, actionType, actionId, targetObjectId, location, param, a7);
     }
 
-    // ── Hook UseAction (log seulement) ────────────────────────────────────────
+    // ── Hook UseAction ────────────────────────────────────────────────────────
 
     private unsafe bool OnUseAction(
         ActionManager* self, ActionType actionType, uint actionId,
         ulong targetId, uint param, uint mode, uint comboRouteId, bool* outOptAreaTargeted)
     {
-        if ((byte)actionType == 11 && actionId == PlacePetActionId)
+        // Logger TOUS les appels type=11 pour identifier les IDs Garde/Talons etc.
+        if ((byte)actionType == 11)
         {
             Log.Information(
-                $"[XIVSchAssitant] [UA] type=11 id=3 target=0x{targetId:X8} mode={mode}");
+                $"[XIVSchAssitant] [UA] type=11 id={actionId} target=0x{targetId:X8} mode={mode}");
         }
         return _useActionHook!.Original(
             self, actionType, actionId, targetId, param, mode, comboRouteId, outOptAreaTargeted);
@@ -153,6 +170,46 @@ public sealed class Plugin : IDalamudPlugin
         }
         catch (Exception ex) { Log.Warning($"[XIVSchAssitant] IsEightPlayerContent: {ex.Message}"); }
         return false;
+    }
+
+    // ── Recherche action de placement au demarrage ───────────────────────────
+    // Log tous les ActionType/ActionId potentiels pour "Se placer" sol.
+
+    private void SearchPetPlaceAction()
+    {
+        try
+        {
+            // Chercher dans la sheet Action (actions regulieres)
+            var actionSheet = Data.GetExcelSheet<Lumina.Excel.Sheets.Action>();
+            if (actionSheet != null)
+            {
+                foreach (var row in actionSheet)
+                {
+                    try
+                    {
+                        string name = row.Name.ExtractText();
+                        if (string.IsNullOrWhiteSpace(name)) continue;
+                        if (name.Contains("placer", StringComparison.OrdinalIgnoreCase)
+                            || name.Contains("place", StringComparison.OrdinalIgnoreCase)
+                            || name.Contains("Heel", StringComparison.OrdinalIgnoreCase)
+                            || name.Contains("Guard", StringComparison.OrdinalIgnoreCase)
+                            || name.Contains("Garde", StringComparison.OrdinalIgnoreCase)
+                            || name.Contains("Talon", StringComparison.OrdinalIgnoreCase))
+                        {
+                            Log.Information(
+                                $"[XIVSchAssitant] [ActionSheet] id={row.RowId} " +
+                                $"name='{name}' cat={row.ActionCategory.RowId} " +
+                                $"job={row.ClassJob.RowId} targetArea={row.TargetArea}");
+                        }
+                    }
+                    catch { }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warning($"[XIVSchAssitant] SearchPetPlaceAction: {ex.Message}");
+        }
     }
 
     // ── Evenements ────────────────────────────────────────────────────────────
@@ -202,22 +259,34 @@ public sealed class Plugin : IDalamudPlugin
             TryPlaceEos();
         }
 
-        // ── Phase 1 : UAL direct (contexte propre, hors hook) ─────────────────
+        // ── Phase 1 : UAL direct ──────────────────────────────────────────────
         if (_pendingDirectUAL)
         {
             _pendingDirectUAL = false;
             DoDirectUAL();
         }
 
-        // ── Phase 2 : ecriture memoire destination Eos ────────────────────────
+        // ── Phase 2 : ecriture memoire one-shot (apres delai server) ──────────
         if (_pendingMemWriteAt.HasValue && DateTime.UtcNow >= _pendingMemWriteAt.Value)
         {
             _pendingMemWriteAt = null;
             DoMemWrite();
         }
 
+        // ── Phase 3 : redirect continu chaque frame ───────────────────────────
+        // Actif apres Dissipation : le serveur (mode Heel) ecrase notre
+        // destination periodiquement. En reecrivant a chaque frame, on
+        // s'assure que la DERNIERE valeur du frame est toujours (100, Y, 100).
+        if (_continuousRedirect)
+        {
+            DoContinuousRedirect();
+        }
+
         // ── Verification periodique du centre ─────────────────────────────────
-        if (isInEightPlayerContent && currentJobId == ScholarJobId
+        // Inhibe pendant le redirect continu pour ne pas envoyer une nouvelle
+        // commande "Se placer <me>" qui remettrait Eos au joueur.
+        if (!_continuousRedirect
+            && isInEightPlayerContent && currentJobId == ScholarJobId
             && DateTime.UtcNow >= nextPeriodicCheck)
         {
             nextPeriodicCheck = DateTime.UtcNow.AddSeconds(5);
@@ -242,6 +311,14 @@ public sealed class Plugin : IDalamudPlugin
 
     private unsafe void TryPlaceEos()
     {
+        // Si un redirect continu est deja actif et Eos est en mouvement vers
+        // le centre, ne pas emettre une nouvelle commande (evite la boucle).
+        if (_continuousRedirect)
+        {
+            Log.Debug("[XIVSchAssitant] TryPlaceEos ignoree — redirect continu actif.");
+            return;
+        }
+
         var playerObj = GameObjectManager.Instance()->Objects.IndexSorted[0].Value;
         if (playerObj == null) return;
 
@@ -256,15 +333,13 @@ public sealed class Plugin : IDalamudPlugin
             $"[XIVSchAssitant] TryPlaceEos — joueur=({playerObj->Position.X:F1},{playerObj->Position.Z:F1}) " +
             $"Eos=({eosObj->Position.X:F2},{eosObj->Position.Z:F2})");
 
-        _eosOwner      = playerObj->EntityId;
-        _memWriteRetry = 3;
-        // Tenter UAL direct au prochain tick Framework.Update (contexte propre)
-        _pendingDirectUAL = true;
+        _eosOwner             = playerObj->EntityId;
+        _memWriteRetry        = 3;
+        _heelModeCancelPending = false;
+        _pendingDirectUAL     = true;
     }
 
     // ── Phase 1 : UAL direct depuis Framework.Update ──────────────────────────
-    // Appel UseActionLocation hors de tout hook, sur le thread principal du jeu.
-    // Teste si le jeu accepte un placement directionnel sans passer par le curseur.
 
     private unsafe void DoDirectUAL()
     {
@@ -277,49 +352,71 @@ public sealed class Plugin : IDalamudPlugin
         }
 
         var center = GetArenaCenter();
+        // Cible 0xE0000000 = aucune entite / placement au sol.
+        // L'action "Se placer" via clic au sol utilise ce targetObjectId,
+        // contrairement a la version entite (<me>) qui retourne toujours False.
+        const ulong GroundTarget = 0xE0000000UL;
         Log.Information(
             $"[XIVSchAssitant] [DirectUAL] centre=({center.X:F1},{center.Y:F1},{center.Z:F1}) " +
-            $"target=0x{playerObj->EntityId:X8}");
+            $"target=0x{GroundTarget:X8} (sol)");
 
-        // Appel via Original pour bypasser notre hook (evite log parasite).
-        // Si le jeu envoie le paquet "deplace Eos vers center" → succes, on s'arrete ici.
         bool result = _ualHook!.Original(
             am, PlacePetActionType, PlacePetActionId,
-            playerObj->EntityId, &center, 0, 0);
+            GroundTarget, &center, 0, 0);
 
         Log.Information($"[XIVSchAssitant] [DirectUAL] result={result}");
 
         if (result)
         {
-            // UAL acceptee : Eos devrait aller au centre. Rien d'autre a faire.
             Log.Information("[XIVSchAssitant] [DirectUAL] Succes — Eos en route vers le centre.");
+            // Activer quand meme le redirect continu pour robustesse (mode Heel).
+            StartContinuousRedirect();
             return;
         }
 
-        // UAL refusee : passage en phase 2.
-        // On envoie d'abord la commande (Eos part vers le joueur),
-        // puis on ecrase la destination en memoire une fois que le serveur l'a ecrite (~500ms).
-        Log.Information("[XIVSchAssitant] [DirectUAL] Echec — fallback ecriture memoire.");
+        // UAL refusee — fallback : commande chat + ecriture memoire one-shot + redirect continu.
+        Log.Information("[XIVSchAssitant] [DirectUAL] Echec — fallback chat + memoire.");
         SendPlaceChatCommand();
         _pendingMemWriteAt = DateTime.UtcNow.AddMilliseconds(700);
+        StartContinuousRedirect();
     }
 
-    private static unsafe void SendPlaceChatCommand()
+    private void StartContinuousRedirect()
+    {
+        _continuousRedirect        = true;
+        _continuousRedirectExpiry  = DateTime.UtcNow.AddSeconds(ContinuousRedirectDuration);
+        Log.Information($"[XIVSchAssitant] [ContRedir] Demarre pour {ContinuousRedirectDuration}s.");
+    }
+
+    private unsafe void SendPlaceChatCommand()
     {
         var uiModule = FFXIVClientStructs.FFXIV.Client.UI.UIModule.Instance();
         if (uiModule == null) return;
+        // Utiliser <t> (cible courante = boss) plutot que <me>.
+        // "Se placer <me>" est interprete par le serveur comme "aller sur le joueur",
+        // ce qui maintient le mode Heel. "<t>" sur un boss force un deplacement
+        // vers une entite non-joueur, ce qui annule le Heel mode cote serveur.
+        Log.Information("[XIVSchAssitant] [ChatCmd] Se placer <t>");
         var msg = new FFXIVClientStructs.FFXIV.Client.System.String.Utf8String(
-            @"/petaction ""Se placer"" <me>");
+            @"/petaction ""Se placer"" <t>");
         uiModule->ProcessChatBoxEntry(&msg, 0, false);
     }
 
-    // ── Phase 2 : ecriture memoire directe sur les offsets destination d'Eos ──
-    // Offsets confirmes par scan :
-    //   +0x3B0 = destination X  (float)
-    //   +0x3B8 = destination Z  (float)
-    //   +0x4E0 = vitesse (0=idle, 6=en deplacement)
-    // Le serveur ecrit ces champs env. 500ms apres l'envoi de la commande.
-    // On ecrase a t+700ms pour rediriger Eos vers (100, Y, 100) au lieu du joueur.
+    private unsafe void SendStayCommand()
+    {
+        var uiModule = FFXIVClientStructs.FFXIV.Client.UI.UIModule.Instance();
+        if (uiModule == null) return;
+        // "En attente" = Stay : desactive le mode Heel cote serveur.
+        // Envoye quand MemWrite detecte que la vitesse reste 0 (Eos colle au joueur
+        // via Heel). Si le nom francais est incorrect, la commande echoue
+        // silencieusement (pas de crash).
+        Log.Information("[XIVSchAssitant] [ChatCmd] Attendre (cancel Heel / verrouillage centre)");
+        var msg = new FFXIVClientStructs.FFXIV.Client.System.String.Utf8String(
+            @"/petaction ""Attendre""");
+        uiModule->ProcessChatBoxEntry(&msg, 0, false);
+    }
+
+    // ── Phase 2 : ecriture memoire one-shot ──────────────────────────────────
 
     private unsafe void DoMemWrite()
     {
@@ -338,33 +435,205 @@ public sealed class Plugin : IDalamudPlugin
         Log.Information(
             $"[XIVSchAssitant] [MemWrite] Avant : dest=({destX:F2},{destZ:F2}) speed={speed:F2}");
 
-        if (speed < 0.1f)
+        if (speed < 0.1f && !_heelModeCancelPending)
         {
-            // Eos pas encore en mouvement — le paquet serveur n'est pas arrive.
-            // Reessayer dans 300ms (jusqu'a _memWriteRetry fois).
+            // Eos pas encore en mouvement (paquet serveur non arrive, ou dist~0).
             if (_memWriteRetry > 0)
             {
                 _memWriteRetry--;
-                Log.Warning($"[XIVSchAssitant] [MemWrite] Eos immobile — retry dans 300ms ({_memWriteRetry} restant(s)).");
+                Log.Warning(
+                    $"[XIVSchAssitant] [MemWrite] Eos immobile — retry dans 300ms " +
+                    $"({_memWriteRetry} restant(s)).");
                 _pendingMemWriteAt = DateTime.UtcNow.AddMilliseconds(300);
             }
             else
             {
-                Log.Warning("[XIVSchAssitant] [MemWrite] Eos toujours immobile apres retries — abandon.");
+                // Eos toujours immobile apres retries (mode Heel actif, Eos deja au joueur).
+                // Envoyer "En attente" pour annuler le Heel cote serveur, puis reessayer
+                // une fois (en ignorant le check speed=0).
+                Log.Warning(
+                    "[XIVSchAssitant] [MemWrite] Eos immobile apres retries — " +
+                    "envoi Attendre pour annuler mode Heel.");
+                ScanHeelTargetField(eosBase);
+                SendStayCommand();
+                _heelModeCancelPending = true;
+                _pendingMemWriteAt = DateTime.UtcNow.AddMilliseconds(600);
             }
             return;
         }
+        if (speed < 0.1f && _heelModeCancelPending)
+        {
+            // "En attente" a ete envoye. Eos est immobile (mode Heel annule, Stay actif).
+            // Forcer l'ecriture de la destination meme a vitesse 0 : le moteur de navigation
+            // lira +0x3B0/3B8 = centre et mettra Eos en mouvement.
+            _heelModeCancelPending = false;
+            Log.Information("[XIVSchAssitant] [MemWrite] Passe forcee post-Stay (speed=0 ignore).");
+            // fall-through vers l'ecriture ci-dessous
+        }
 
-        // Eos est en mouvement : ecraser la destination.
         var center = GetArenaCenter();
+        // Ecriture destination navigation uniquement.
+        // NOTE : +0x0B0/0x0B8 = position entite logique (nameplate CS) — NE PAS
+        // ecrire ici : deplace le nameplate sans bouger le skin/la source de soin.
         *(float*)(eosBase + 0x3B0) = center.X;
         *(float*)(eosBase + 0x3B8) = center.Z;
 
-        // Verification immediate
         float verX = *(float*)(eosBase + 0x3B0);
         float verZ = *(float*)(eosBase + 0x3B8);
         Log.Information(
             $"[XIVSchAssitant] [MemWrite] Apres : dest=({verX:F2},{verZ:F2})  cible=({center.X:F1},{center.Z:F1})");
+    }
+
+    // ── Scan diagnostique mode Heel ───────────────────────────────────────────
+    // Cherche l'entity ID du joueur dans la memoire d'Eos pour identifier
+    // le champ "cible Heel". Appele une seule fois quand retries epuises.
+
+    private bool _heelScanDone;
+
+    private unsafe void ScanHeelTargetField(nint eosBase)
+    {
+        if (_heelScanDone) return; // une seule fois par session
+        _heelScanDone = true;
+
+        var playerObj = GameObjectManager.Instance()->Objects.IndexSorted[0].Value;
+        if (playerObj == null) return;
+
+        uint playerIdLow  = playerObj->EntityId;
+        ulong playerIdFull = playerObj->EntityId; // même valeur en 64 bits
+
+        Log.Information(
+            $"[XIVSchAssitant] [HeelScan] Debut — EntityId joueur = 0x{playerIdLow:X8}");
+
+        // Scanner les offsets +0x00 a +0x600 par pas de 4 octets.
+        // On cherche la valeur de l'entity ID du joueur (uint ou uint basse de ulong).
+        var hits = new System.Text.StringBuilder();
+        for (var off = 0; off <= 0x600; off += 4)
+        {
+            try
+            {
+                uint val32 = *(uint*)(eosBase + off);
+                if (val32 == playerIdLow && playerIdLow != 0)
+                    hits.Append($"+0x{off:X3}(u32) ");
+
+                // Aussi tester uint interpretee comme float : player position ~100
+                float vf = *(float*)(eosBase + off);
+                // Les positions du joueur sont autour de 80-120 typiquement
+                if (vf >= 75f && vf <= 125f && off != 0x3B0 && off != 0x3B8)
+                    hits.Append($"+0x{off:X3}(f{vf:F1}) ");
+            }
+            catch { }
+        }
+        Log.Information($"[XIVSchAssitant] [HeelScan] EntityId 0x{playerIdLow:X8} trouve a : {hits}");
+
+        // Log aussi des offsets suspects autour de 0x3B0 en brut
+        Log.Information("[XIVSchAssitant] [HeelScan] Dump brut +0x380..+0x3D0 :");
+        var dump = new System.Text.StringBuilder();
+        for (var off = 0x380; off <= 0x3D0; off += 4)
+        {
+            uint v = *(uint*)(eosBase + off);
+            float f = *(float*)(eosBase + off);
+            dump.Append($"[+{off:X3}] 0x{v:X8}={f:F2}  ");
+            if ((off - 0x380) % 0x10 == 0x0C) { Log.Information("[XIVSchAssitant] [HeelScan] " + dump); dump.Clear(); }
+        }
+        if (dump.Length > 0) Log.Information("[XIVSchAssitant] [HeelScan] " + dump);
+
+        // Et autour de 0x4D0
+        Log.Information("[XIVSchAssitant] [HeelScan] Dump brut +0x4D0..+0x500 :");
+        dump.Clear();
+        for (var off = 0x4C0; off <= 0x500; off += 4)
+        {
+            uint v = *(uint*)(eosBase + off);
+            float f = *(float*)(eosBase + off);
+            dump.Append($"[+{off:X3}] 0x{v:X8}={f:F2}  ");
+            if ((off - 0x4C0) % 0x10 == 0x0C) { Log.Information("[XIVSchAssitant] [HeelScan] " + dump); dump.Clear(); }
+        }
+        if (dump.Length > 0) Log.Information("[XIVSchAssitant] [HeelScan] " + dump);
+    }
+
+    // ── Phase 3 : redirect continu chaque frame ───────────────────────────────
+    // Cadence : ~60 fps. En mode Heel, le Heel AI (qui tourne APRES
+    // Framework.Update) ecrase notre destination chaque frame.
+    // En mode non-Heel (normal), notre ecriture est definitive.
+    // Cette phase sert de secours au cas ou le Heel AI est ralenti ou coupe.
+    //
+    // IMPORTANT : on ne stoppe PAS sur la position — faux positifs possible.
+    // On laisse tourner pendant ContinuousRedirectDuration secondes.
+    // C'est CheckAndRepositionEos (apres expiry) qui reprend la main ensuite.
+
+    private unsafe void DoContinuousRedirect()
+    {
+        // Timeout : on laisse la verif periodique reprendre
+        if (DateTime.UtcNow >= _continuousRedirectExpiry)
+        {
+            _continuousRedirect = false;
+            Log.Information("[XIVSchAssitant] [ContRedir] Expiry — redirection terminee.");
+
+            // Si Eos est au centre a l'expiry, envoyer "En attente" pour verrouiller
+            // sa position : annule la destination boss issue de "Se placer <t>".
+            // Sans ca, Eos repart vers le boss des que ContRedir s'arrete.
+            var eosAtExpiry = FindEosObject(_eosOwner);
+            if (eosAtExpiry != null)
+            {
+                float targetCx = 100f, targetCz = 100f;
+                if (ArenaExceptions.TryGetValue(ClientState.TerritoryType, out var exEntry))
+                { targetCx = exEntry.X; targetCz = exEntry.Z; }
+
+                // Utiliser la position CS (obj->Position) coherente avec CheckAndRepositionEos.
+                float csXExp   = eosAtExpiry->Position.X;
+                float csZExp   = eosAtExpiry->Position.Z;
+                float distExp  = MathF.Sqrt(
+                    (csXExp - targetCx) * (csXExp - targetCx) +
+                    (csZExp - targetCz) * (csZExp - targetCz));
+                Log.Information(
+                    $"[XIVSchAssitant] [ContRedir] Expiry check: csPos=({csXExp:F2},{csZExp:F2}) " +
+                    $"dist={distExp:F2} threshold={PlacementThreshold}");
+                if (distExp < PlacementThreshold)
+                {
+                    Log.Information(
+                        $"[XIVSchAssitant] [ContRedir] Eos au centre (dist={distExp:F1}) " +
+                        "— En attente pour verrouiller.");
+                    SendStayCommand();
+                    _lastStaySentAt = DateTime.UtcNow;
+                    // Ne pas relancer la verif immediatement : Eos est deja au centre,
+                    // on repart au cycle normal de 5s.
+                    nextPeriodicCheck = DateTime.UtcNow.AddSeconds(5);
+                    return;
+                }
+            }
+            else
+            {
+                Log.Warning("[XIVSchAssitant] [ContRedir] Expiry check: Eos non trouvee.");
+            }
+
+            nextPeriodicCheck = DateTime.UtcNow; // relancer la verif periodique immediatement
+            return;
+        }
+
+        var eosObj = FindEosObject(_eosOwner);
+        if (eosObj == null)
+        {
+            // Eos disparue (mort, renvoyee) — arreter
+            _continuousRedirect = false;
+            return;
+        }
+
+        float cx = 100f, cz = 100f;
+        if (ArenaExceptions.TryGetValue(ClientState.TerritoryType, out var ex))
+        { cx = ex.X; cz = ex.Z; }
+
+        nint eosBase = (nint)eosObj;
+
+        // Ecraser la destination de navigation vers le centre.
+        // En mode non-Heel, cela suffit : Eos suit la destination.
+        // En mode Heel (apres Dissipation), le Heel AI ecrase +0x3B0/3B8
+        // apres notre write — mais chaque frame ou on gagne la course on
+        // progresse legerement. Associe a la commande <t> (cible boss) dans
+        // DoDirectUAL, cette approche finit par l'emporter.
+        *(float*)(eosBase + 0x3B0) = cx;
+        *(float*)(eosBase + 0x3B8) = cz;
+        // NOTE : +0x0B0/0x0B8 = position entite logique (nameplate CS) — NE PAS
+        // ecrire ici : ca deplace le nameplate sans deplacer le skin / la source
+        // de soins, ce qui cree un bug visuel et fonctionnel.
     }
 
     // ── Verification periodique ───────────────────────────────────────────────
@@ -393,7 +662,20 @@ public sealed class Plugin : IDalamudPlugin
                 $"[XIVSchAssitant] Eos @ ({obj->Position.X:F1},{obj->Position.Y:F1},{obj->Position.Z:F1}) " +
                 $"dist={dist:F1}");
 
-            if (dist <= PlacementThreshold) return;
+            if (dist <= PlacementThreshold)
+            {
+                // Eos est au centre. Envoyer "En attente" periodiquement pour la
+                // verrouiller sur place et annuler la destination boss issue de
+                // "Se placer <t>". Cooldown 25s pour eviter le spam.
+                if (!_continuousRedirect &&
+                    (DateTime.UtcNow - _lastStaySentAt).TotalSeconds > 25.0)
+                {
+                    Log.Information("[XIVSchAssitant] [Periodic] Eos au centre — En attente (verrou).");
+                    SendStayCommand();
+                    _lastStaySentAt = DateTime.UtcNow;
+                }
+                return;
+            }
 
             Log.Debug("[XIVSchAssitant] Eos hors du centre — repositionnement.");
             TryPlaceEos();
