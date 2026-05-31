@@ -513,22 +513,20 @@ public sealed class Plugin : IDalamudPlugin
     {
         var uiModule = FFXIVClientStructs.FFXIV.Client.UI.UIModule.Instance();
         if (uiModule == null) return;
-        // Preferer <t> (boss) pour annuler le mode Heel serveur.
-        // Fallback <me> si aucune cible (debut d'instance, hors combat).
-        if (TargetMgr.Target != null)
+        if (TargetMgr.Target == null)
         {
-            Log.Information($"[XIVSchAssitant] [ChatCmd] {_placePetActionName} <t>");
-            var msg = new FFXIVClientStructs.FFXIV.Client.System.String.Utf8String(
-                $@"/petaction ""{_placePetActionName}"" <t>");
-            uiModule->ProcessChatBoxEntry(&msg, 0, false);
+            // "Se placer <me>" est rejete par le jeu — la commande necessite une cible ennemie.
+            // On annule l'injection et on attend : la detection d'acquisition de cible
+            // (OnFrameworkUpdate) declenchera un repositionnement immediat des que le
+            // joueur cible le boss.
+            _interceptNextPlacePacket = false;
+            Log.Debug("[XIVSchAssitant] [ChatCmd] Pas de cible — placement differe.");
+            return;
         }
-        else
-        {
-            Log.Information($"[XIVSchAssitant] [ChatCmd] {_placePetActionName} <me>");
-            var msg = new FFXIVClientStructs.FFXIV.Client.System.String.Utf8String(
-                $@"/petaction ""{_placePetActionName}"" <me>");
-            uiModule->ProcessChatBoxEntry(&msg, 0, false);
-        }
+        Log.Information($"[XIVSchAssitant] [ChatCmd] {_placePetActionName} <t>");
+        var msg = new FFXIVClientStructs.FFXIV.Client.System.String.Utf8String(
+            $@"/petaction ""{_placePetActionName}"" <t>");
+        uiModule->ProcessChatBoxEntry(&msg, 0, false);
     }
 
     private unsafe void SendStayCommand()
