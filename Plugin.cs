@@ -535,9 +535,12 @@ public sealed class Plugin : IDalamudPlugin
     {
         var uiModule = FFXIVClientStructs.FFXIV.Client.UI.UIModule.Instance();
         if (uiModule == null) return;
-        Log.Information($"[XIVSchAssitant] [ChatCmd] {_stayPetActionName} <me>");
+        // "Attendre" sans cible = rester en place.
+        // Avec <me> le jeu interpretait ca comme "rejoindre le joueur et rester la"
+        // ce qui causait un aller-retour centre ↔ joueur en boucle.
+        Log.Information($"[XIVSchAssitant] [ChatCmd] {_stayPetActionName}");
         var msg = new FFXIVClientStructs.FFXIV.Client.System.String.Utf8String(
-            $@"/petaction ""{_stayPetActionName}"" <me>");
+            $@"/petaction ""{_stayPetActionName}""");
         uiModule->ProcessChatBoxEntry(&msg, 0, false);
     }
 
