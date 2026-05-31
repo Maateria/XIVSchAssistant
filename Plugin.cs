@@ -78,10 +78,6 @@ public sealed class Plugin : IDalamudPlugin
     // soit debout et hors chargement pour invoquer Eos.
     private bool      _pendingEosSummonAfterWipe;
     private DateTime? scheduledPlaceEos;
-    // Envoie "Attendre" 2s apres chaque "Se placer" pour verrouiller Eos au centre.
-    // Independant du check periodique pour garantir l'envoi meme si nextPeriodicCheck
-    // est court-circuite par DetectPetEntityChange ou l'acquisition de cible.
-    private DateTime? scheduledStayEos;
     // Verification differee qu'Eos est invoquee (login, swap job, entree en instance).
     // Utilise un delai pour laisser le jeu finir son chargement avant de tenter l'invocation.
     private DateTime? scheduledEosCheck;
@@ -260,15 +256,6 @@ public sealed class Plugin : IDalamudPlugin
         {
             scheduledPlaceEos = null;
             TryPlaceEos();
-        }
-
-        // ── Attendre planifie (apres Se placer) ───────────────────────────────
-        // Verrouille Eos au centre 2s apres chaque placement.
-        if (scheduledStayEos.HasValue && DateTime.UtcNow >= scheduledStayEos.Value)
-        {
-            scheduledStayEos = null;
-            SendStayCommand();
-            _lastStaySentAt = DateTime.UtcNow;
         }
 
         // ── Placement en attente ──────────────────────────────────────────────
@@ -518,9 +505,6 @@ public sealed class Plugin : IDalamudPlugin
         _pendingPlaceCenter       = center;
         _interceptNextPlacePacket = true;
         SendPlaceChatCommand();
-        // Planifier "Attendre" 2s apres le placement pour verrouiller Eos au centre.
-        // Evite qu'elle reparte en mode "suivre" entre le placement et le prochain check periodique.
-        scheduledStayEos = DateTime.UtcNow.AddSeconds(2.0);
     }
 
     // ── Commandes chat ────────────────────────────────────────────────────────
@@ -551,12 +535,9 @@ public sealed class Plugin : IDalamudPlugin
     {
         var uiModule = FFXIVClientStructs.FFXIV.Client.UI.UIModule.Instance();
         if (uiModule == null) return;
-        // "Attendre" sans cible = rester en place.
-        // Avec <me> le jeu interpretait ca comme "rejoindre le joueur et rester la"
-        // ce qui causait un aller-retour centre ↔ joueur en boucle.
-        Log.Information($"[XIVSchAssitant] [ChatCmd] {_stayPetActionName}");
+        Log.Information($"[XIVSchAssitant] [ChatCmd] {_stayPetActionName} <me>");
         var msg = new FFXIVClientStructs.FFXIV.Client.System.String.Utf8String(
-            $@"/petaction ""{_stayPetActionName}""");
+            $@"/petaction ""{_stayPetActionName}"" <me>");
         uiModule->ProcessChatBoxEntry(&msg, 0, false);
     }
 
@@ -688,10 +669,6 @@ public sealed class Plugin : IDalamudPlugin
             //  via nextPeriodicCheck = DateTime.UtcNow dans OnFrameworkUpdate.)
             Log.Debug($"[XIVSchAssitant] Eos hors centre (dist={dist:F1}) — repositionnement.");
             nextPeriodicCheck = DateTime.UtcNow.AddSeconds(5.0);
-            // Reset du cooldown "Attendre" pour qu'elle soit envoyee immediatement
-            // au prochain check qui trouve Eos au centre — sinon Eos reste en mode
-            // "suivre" apres placement et revient vers le joueur des qu'il bouge.
-            _lastStaySentAt = DateTime.MinValue;
             TryPlaceEos();
             return;
         }
