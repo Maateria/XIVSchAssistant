@@ -1,0 +1,18 @@
+[
+  {
+    "Author": "Maateria",
+    "Name": "XIVSchAssitant",
+    "InternalName": "XIVSchAssitant",
+    "AssemblyVersion": "1.0.0.0",
+    "Description": "Work in progress",
+    "ApplicableVersion": "any",
+    "RepoUrl": "https://github.com/Maateria/XIVSchAssistant",
+    "Punchline": "Assistant automatique pour l'Erudit : Eos, repositionnement, alertes DoT et cooldown.",
+    "Tags": ["scholar", "eos", "fairy", "SCH", "erudit"],
+    "DalamudApiLevel": 15,
+    "IconUrl": "",
+    "DownloadLinkInstall": "https://github.com/Maateria/XIVSchAssistant/releases/latest/download/latest.zip",
+    "DownloadLinkTesting": "https://github.com/Maateria/XIVSchAssistant/releases/latest/download/latest.zip",
+    "DownloadLinkUpdate": "https://github.com/Maateria/XIVSchAssistant/releases/latest/download/latest.zip"
+  }
+]

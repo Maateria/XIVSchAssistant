@@ -1,12 +1,12 @@
 {
-  "Author": "Utilisateur",
+  "Author": "Maateria",
   "Name": "XIVSchAssitant",
-  "Description": "Invoque automatiquement Eos lors d'un changement de job vers Erudit et lors d'une resurrection.",
+  "Description": "Work in progress",
   "InternalName": "XIVSchAssitant",
   "AssemblyVersion": "1.0.0.0",
-  "RepoUrl": "",
-  "Punchline": "Auto-invoque Eos quand tu swap sur Erudit ou a la resurrection.",
-  "Tags": ["scholar", "eos", "fairy", "SCH"],
+  "RepoUrl": "https://github.com/Maateria/XIVSchAssistant",
+  "Punchline": "Assistant automatique pour l'Erudit : Eos, repositionnement, alertes DoT et cooldown.",
+  "Tags": ["scholar", "eos", "fairy", "SCH", "erudit"],
   "DalamudApiLevel": 15,
   "ApplicableVersion": "any"
 }
