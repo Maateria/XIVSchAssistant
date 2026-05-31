@@ -672,6 +672,10 @@ public sealed class Plugin : IDalamudPlugin
             //  via nextPeriodicCheck = DateTime.UtcNow dans OnFrameworkUpdate.)
             Log.Debug($"[XIVSchAssitant] Eos hors centre (dist={dist:F1}) — repositionnement.");
             nextPeriodicCheck = DateTime.UtcNow.AddSeconds(5.0);
+            // Reset du cooldown "Attendre" pour qu'elle soit envoyee immediatement
+            // au prochain check qui trouve Eos au centre — sinon Eos reste en mode
+            // "suivre" apres placement et revient vers le joueur des qu'il bouge.
+            _lastStaySentAt = DateTime.MinValue;
             TryPlaceEos();
             return;
         }
