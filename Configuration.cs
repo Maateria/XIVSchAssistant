@@ -1,4 +1,5 @@
 using Dalamud.Configuration;
+using Dalamud.Plugin;
 
 namespace XIVSchAssitant;
 
@@ -7,11 +8,21 @@ public class Configuration : IPluginConfiguration
 {
     public int Version { get; set; } = 0;
 
-    public bool Enabled { get; set; } = true;
+    // ── Eos ──────────────────────────────────────────────────────────────────
+    public bool AutoSummonEnabled { get; set; } = true;
+    public bool AutoPlaceEnabled  { get; set; } = true;
 
-    // Alerte sonore quand Biolysis (Loi de l'infection) tombe du boss.
-    public bool DotAlertEnabled { get; set; } = true;
+    // ── Alerte DoT Biolysis ───────────────────────────────────────────────────
+    public bool  DotAlertEnabled { get; set; } = true;
+    public float DotAlertVolume  { get; set; } = 1.0f; // 0.0 → 1.0
 
-    // Compte a rebours local 5s avant que Chain Stratagem / Emergency Tactics revienne.
-    public bool CooldownAlertEnabled { get; set; } = true;
+    // ── Chain Stratagem — Compte a rebours ────────────────────────────────────
+    public bool CountdownOverlayEnabled { get; set; } = true;
+    public bool CountdownSoundEnabled   { get; set; } = true;
+
+    [NonSerialized]
+    private IDalamudPluginInterface? _pluginInterface;
+
+    public void Initialize(IDalamudPluginInterface pi) => _pluginInterface = pi;
+    public void Save() => _pluginInterface?.SavePluginConfig(this);
 }

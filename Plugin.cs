@@ -2,11 +2,13 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Game.ClientState.Objects.Types;
+using Dalamud.Game.Command;
 using Dalamud.Game.DutyState;
 using Dalamud.Hooking;
 using Dalamud.IoC;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
+using Dalamud.Interface.Windowing;
 using FFXIVClientStructs.FFXIV.Application.Network;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.Game.Object;
@@ -35,12 +37,10 @@ public sealed class Plugin : IDalamudPlugin
     // Spells pour l'alerte compte a rebours cooldown
     private const uint ChainStratagemActionId   = 7436;  // Stratagemes Entrelaces (~120s CD)
 
-    // ── WinMM PlaySound (alerte sonore DoT) ──────────────────────────────────
-    // Lecture WAV asynchrone via l'API Windows, sans dependance externe.
+    // ── WinMM mciSendString (alerte sonore DoT avec controle volume) ─────────
     [DllImport("winmm.dll", CharSet = CharSet.Auto)]
-    private static extern bool PlaySound(string? pszSound, nint hmod, uint fdwSound);
-    private const uint SND_FILENAME  = 0x00020000; // pszSound est un chemin de fichier
-    private const uint SND_ASYNC     = 0x0001;     // lecture non bloquante
+    private static extern int mciSendString(string command,
+        System.Text.StringBuilder? returnString, int returnLength, nint callback);
 
     // Seuil de distance (metres) en dessous duquel Eos est consideree "au centre"
     private const float PlacementThreshold = 3f;
@@ -68,8 +68,12 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal ITargetManager           TargetMgr       { get; init; } = null!;
     [PluginService] internal IBuddyList               BuddyList       { get; init; } = null!;
     [PluginService] internal IDutyState               DutyState       { get; init; } = null!;
+    [PluginService] internal ICommandManager          CommandManager  { get; init; } = null!;
 
     internal Configuration Config { get; }
+
+    private readonly WindowSystem _windowSystem;
+    private readonly ConfigWindow _configWindow;
 
     // ── Etat global ───────────────────────────────────────────────────────────
     // Vrai quand un DutyWiped vient d'etre detecte — en attente que le joueur
@@ -131,8 +135,9 @@ public sealed class Plugin : IDalamudPlugin
 
     public Plugin()
     {
-        Log.Information("[XIVSchAssitant] Demarrage...");
         Config = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
+        Config.Initialize(PluginInterface);
+        Log.Information("[XIVSchAssitant] Demarrage...");
         isInEightPlayerContent = IsEightPlayerContent(ClientState.TerritoryType);
 
         unsafe
@@ -146,7 +151,16 @@ public sealed class Plugin : IDalamudPlugin
             _sendPacketHook.Enable();
         }
 
+        _windowSystem = new WindowSystem("XIVSchAssitant");
+        _configWindow = new ConfigWindow(Config, this);
+        _windowSystem.AddWindow(_configWindow);
+        PluginInterface.UiBuilder.Draw += _windowSystem.Draw;
         PluginInterface.UiBuilder.Draw += OnDraw;
+        PluginInterface.UiBuilder.OpenConfigUi += OnOpenConfigUi;
+        CommandManager.AddHandler("/xivsch", new CommandInfo(OnXivSchCommand)
+        {
+            HelpMessage = "Open XIVSchAssistant settings.",
+        });
         // Police haute resolution pour le countdown — TrumpGothicE est le
         // font "grand format" du jeu (barres HP, titres), ideal pour des chiffres.
         _countdownFont = PluginInterface.UiBuilder.FontAtlas.NewGameFontHandle(
@@ -173,13 +187,29 @@ public sealed class Plugin : IDalamudPlugin
         Log.Information("[XIVSchAssitant] Charge — hook ZoneClient.SendPacket actif.");
     }
 
+    // ── Commandes et config UI ────────────────────────────────────────────────
+
+    private void OnOpenConfigUi()
+        => _configWindow.IsOpen = true;
+
+    private void OnXivSchCommand(string command, string args)
+        => _configWindow.IsOpen = true;
+
+    internal void TestDotSound()
+    {
+        _lastDotAlertAt = DateTime.MinValue;
+        PlayDotAlert();
+    }
+
+    internal void TestCountdown() => TriggerLocalCountdown(5f);
+
     // ── Evenements ────────────────────────────────────────────────────────────
 
     // Declenche quand tout le groupe est mort et que l'ecran passe au noir.
     // Ne fire PAS sur un rez individuel en combat → detection fiable du wipe global.
     private void OnDutyWiped(IDutyStateEventArgs args)
     {
-        if (!Config.Enabled) return;
+        if (!Config.AutoSummonEnabled) return;
         if (currentJobId != ScholarJobId) return;
         Log.Information("[XIVSchAssitant] DutyWiped — Eos sera invoquee apres resurrection.");
         _pendingEosSummonAfterWipe = true;
@@ -195,7 +225,7 @@ public sealed class Plugin : IDalamudPlugin
 
         // Verifier qu'Eos est invoquee dans tout contenu instancie (donjon, trial, raid...).
         // Delai de 5s pour laisser l'instance finir de charger avant de tenter l'invocation.
-        if (Config.Enabled && IsAnyInstanceContent(territoryType))
+        if (Config.AutoSummonEnabled && IsAnyInstanceContent(territoryType))
         {
             Log.Debug($"[XIVSchAssitant] Entree instance — verification Eos dans 5s.");
             scheduledEosCheck = DateTime.UtcNow.AddSeconds(5);
@@ -205,7 +235,7 @@ public sealed class Plugin : IDalamudPlugin
     private void OnClassJobChanged(uint classJobId)
     {
         currentJobId = classJobId;
-        if (!Config.Enabled) return;
+        if (!Config.AutoSummonEnabled) return;
         // Ne pas declencher pendant un changement de zone (identique a PandorasBox).
         if (Condition[ConditionFlag.BetweenAreas]) return;
         if (classJobId == ScholarJobId)
@@ -219,14 +249,10 @@ public sealed class Plugin : IDalamudPlugin
 
     private void OnFrameworkUpdate(IFramework framework)
     {
-        if (!Config.Enabled) return;
         if (!ClientState.IsLoggedIn) return;
 
         // ── Post-wipe : attente resurrection ─────────────────────────────────────
-        // DutyWiped a ete detecte (OnDutyWiped) — on attend que le joueur soit
-        // debout et hors chargement (Unconscious=false, BetweenAreas*=false)
-        // avant de planifier l'invocation d'Eos.
-        if (_pendingEosSummonAfterWipe
+        if (Config.AutoSummonEnabled && _pendingEosSummonAfterWipe
             && !Condition[ConditionFlag.Unconscious]
             && !Condition[ConditionFlag.BetweenAreas]
             && !Condition[ConditionFlag.BetweenAreas51])
@@ -260,8 +286,6 @@ public sealed class Plugin : IDalamudPlugin
         }
 
         // ── Detection acquisition de cible ────────────────────────────────────
-        // Quand le joueur cible le boss pour la premiere fois, "Se placer <t>"
-        // devient disponible — on declenche un repositionnement immediat.
         {
             uint newTargetId = TargetMgr.Target != null ? TargetMgr.Target.EntityId : 0u;
             if (newTargetId != _lastTargetId)
@@ -269,6 +293,7 @@ public sealed class Plugin : IDalamudPlugin
                 bool wasNoTarget = _lastTargetId == 0;
                 _lastTargetId = newTargetId;
                 if (wasNoTarget && newTargetId != 0
+                    && Config.AutoPlaceEnabled
                     && isInEightPlayerContent && currentJobId == ScholarJobId)
                 {
                     Log.Information(
@@ -326,12 +351,11 @@ public sealed class Plugin : IDalamudPlugin
         }
 
         // ── Detection swap Seraph / Eos ───────────────────────────────────────
-        // Chaque frame : detecte tout changement d'entite pet (Dissipation, Seraphim).
-        if (isInEightPlayerContent && currentJobId == ScholarJobId)
+        if (Config.AutoPlaceEnabled && isInEightPlayerContent && currentJobId == ScholarJobId)
             DetectPetEntityChange();
 
         // ── Verification periodique ───────────────────────────────────────────
-        if (isInEightPlayerContent && currentJobId == ScholarJobId
+        if (Config.AutoPlaceEnabled && isInEightPlayerContent && currentJobId == ScholarJobId
             && DateTime.UtcNow >= nextPeriodicCheck)
         {
             CheckAndRepositionEos();
@@ -378,11 +402,9 @@ public sealed class Plugin : IDalamudPlugin
             _biolysisWasActive = false;
         }
 
-        // ── Alerte cooldown Chain Stratagem / Emergency Tactics ───────────────────
-        // 5 secondes avant que le skill revienne, declenche un compte a rebours natif
-        // local (non diffuse au groupe — ecriture directe dans la structure du timer).
-        // Pas de guard InCombat : on veut l'alerte meme entre deux pulls.
-        if (Config.CooldownAlertEnabled && currentJobId == ScholarJobId)
+        // ── Alerte cooldown Chain Stratagem ──────────────────────────────────────
+        if ((Config.CountdownOverlayEnabled || Config.CountdownSoundEnabled)
+            && currentJobId == ScholarJobId)
             CheckCooldownAlert();
 
         // ── Tick overlay compte a rebours ─────────────────────────────────────────
@@ -402,7 +424,8 @@ public sealed class Plugin : IDalamudPlugin
                 if (tick < _localCountdownLastTick)
                 {
                     _localCountdownLastTick = tick;
-                    unsafe { UIGlobals.PlaySoundEffect(48); }
+                    if (Config.CountdownSoundEnabled)
+                        unsafe { UIGlobals.PlaySoundEffect(48); }
                 }
             }
         }
@@ -414,7 +437,7 @@ public sealed class Plugin : IDalamudPlugin
     {
         Log.Information("[XIVSchAssitant] Invocation d'Eos...");
         ActionManager.Instance()->UseAction(ActionType.Action, SummonEosActionId);
-        if (isInEightPlayerContent)
+        if (Config.AutoPlaceEnabled && isInEightPlayerContent)
         {
             scheduledPlaceEos = DateTime.UtcNow.AddSeconds(PlaceEosDelay);
             Log.Information($"[XIVSchAssitant] Placement planifie dans {PlaceEosDelay}s.");
@@ -425,8 +448,8 @@ public sealed class Plugin : IDalamudPlugin
     // Necessaire pour invoquer Eos si le perso est deja en Erudit au login.
     private void OnLogin()
     {
+        if (!Config.AutoSummonEnabled) return;
         Log.Information("[XIVSchAssitant] Connexion detectee — verification Eos dans 5s.");
-        // Delai de 5s : le perso n'est pas completement charge au moment de l'evenement.
         scheduledEosCheck = DateTime.UtcNow.AddSeconds(5);
     }
 
@@ -435,7 +458,7 @@ public sealed class Plugin : IDalamudPlugin
     // Utilise BuddyList.PetBuddy comme PandorasBox/AutoFairy.
     private unsafe void CheckAndSummonEos()
     {
-        if (!Config.Enabled) return;
+        if (!Config.AutoSummonEnabled) return;
         if (!ClientState.IsLoggedIn) return;
 
         // Re-lire le job depuis PlayerState UNIQUEMENT si currentJobId n'est pas
@@ -791,20 +814,23 @@ public sealed class Plugin : IDalamudPlugin
 
     private void PlayDotAlert()
     {
-        // Cooldown 3s : evite le spam si la detection oscille rapidement
         if ((DateTime.UtcNow - _lastDotAlertAt).TotalSeconds < 3.0) return;
         _lastDotAlertAt = DateTime.UtcNow;
         Log.Debug("[XIVSchAssitant] [DotAlert] Biolysis tombe — lecture son.");
         try
         {
-            if (_dotSoundPath != null && File.Exists(_dotSoundPath))
-                PlaySound(_dotSoundPath, nint.Zero, SND_FILENAME | SND_ASYNC);
-            else
-                Log.Warning("[XIVSchAssitant] [DotAlert] Fichier son manquant.");
+            if (_dotSoundPath == null || !File.Exists(_dotSoundPath))
+            { Log.Warning("[XIVSchAssitant] [DotAlert] Fichier son manquant."); return; }
+
+            int vol = Math.Clamp((int)(Config.DotAlertVolume * 1000f), 0, 1000);
+            mciSendString("close xivschsnd", null, 0, nint.Zero);
+            mciSendString($"open \"{_dotSoundPath}\" alias xivschsnd", null, 0, nint.Zero);
+            mciSendString($"setaudio xivschsnd volume to {vol}", null, 0, nint.Zero);
+            mciSendString("play xivschsnd", null, 0, nint.Zero);
         }
         catch (Exception ex)
         {
-            Log.Warning($"[XIVSchAssitant] [DotAlert] Erreur : {ex.Message}");
+            Log.Warning($"[XIVSchAssitant] [DotAlert] Erreur audio : {ex.Message}");
         }
     }
 
@@ -817,9 +843,9 @@ public sealed class Plugin : IDalamudPlugin
         _localCountdownActive    = true;
         _localCountdownStartValue = seconds;
         _localCountdownStart     = DateTime.UtcNow;
-        _localCountdownLastTick  = (int)Math.Ceiling(seconds); // ex: 5
-        // Son du premier chiffre immediatement
-        unsafe { UIGlobals.PlaySoundEffect(48); }
+        _localCountdownLastTick  = (int)Math.Ceiling(seconds);
+        if (Config.CountdownSoundEnabled)
+            unsafe { UIGlobals.PlaySoundEffect(48); }
         Log.Information($"[XIVSchAssitant] [CooldownAlert] Compte a rebours {seconds:F1}s (overlay ImGui).");
     }
 
@@ -827,7 +853,7 @@ public sealed class Plugin : IDalamudPlugin
     // Pas de fenetre ImGui — aucun artefact de frame/padding, centrage pixel-perfect.
     private void OnDraw()
     {
-        if (!_localCountdownActive) return;
+        if (!_localCountdownActive || !Config.CountdownOverlayEnabled) return;
         float elapsed   = (float)(DateTime.UtcNow - _localCountdownStart).TotalSeconds;
         float remaining = _localCountdownStartValue - elapsed;
         if (remaining <= 0f) { _localCountdownActive = false; return; }
@@ -891,6 +917,11 @@ public sealed class Plugin : IDalamudPlugin
 
     public void Dispose()
     {
+        CommandManager.RemoveHandler("/xivsch");
+        PluginInterface.UiBuilder.OpenConfigUi -= OnOpenConfigUi;
+        PluginInterface.UiBuilder.Draw -= _windowSystem.Draw;
+        _windowSystem.RemoveAllWindows();
+        mciSendString("close xivschsnd", null, 0, nint.Zero);
         _countdownFont?.Dispose();
         _sendPacketHook?.Dispose();
         PluginInterface.UiBuilder.Draw -= OnDraw;
