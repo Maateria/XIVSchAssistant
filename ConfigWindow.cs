@@ -9,6 +9,11 @@ public sealed class ConfigWindow : Window
     private readonly Configuration _config;
     private readonly Plugin        _plugin;
 
+    // ── Edit state for custom center section ──────────────────────────────────
+    private uint  _editTerritoryCache = uint.MaxValue;
+    private float _editX = 100f;
+    private float _editZ = 100f;
+
     public ConfigWindow(Configuration config, Plugin plugin)
         : base("XIVSchAssistant — Settings##xivschcfg")
     {
@@ -16,8 +21,8 @@ public sealed class ConfigWindow : Window
         _plugin = plugin;
         SizeConstraints = new WindowSizeConstraints
         {
-            MinimumSize = new Vector2(400, 310),
-            MaximumSize = new Vector2(600, 600),
+            MinimumSize = new Vector2(420, 380),
+            MaximumSize = new Vector2(620, 750),
         };
     }
 
@@ -74,6 +79,100 @@ public sealed class ConfigWindow : Window
             ImGui.Spacing();
             if (ImGui.Button("Test countdown (5s)"))
                 _plugin.TestCountdown();
+        }
+
+        ImGui.Spacing();
+
+        // ── Custom Arena Centers ──────────────────────────────────────────────
+        if (ImGui.CollapsingHeader("Custom Arena Centers", ImGuiTreeNodeFlags.DefaultOpen))
+        {
+            var territory = _plugin.CurrentTerritoryType;
+
+            // Sync edit fields when territory changes
+            if (territory != _editTerritoryCache)
+            {
+                _editTerritoryCache = territory;
+                if (_config.CustomCenters.TryGetValue(territory, out var saved))
+                { _editX = saved.X; _editZ = saved.Z; }
+                else
+                { _editX = 100f; _editZ = 100f; }
+            }
+
+            if (territory == 0)
+            {
+                ImGui.TextDisabled("Enter an 8-player raid to configure its arena center.");
+            }
+            else
+            {
+                bool hasCustom = _config.CustomCenters.ContainsKey(territory);
+
+                ImGui.Text($"Territory: {territory}  ");
+                ImGui.SameLine();
+                if (hasCustom)
+                    ImGui.TextColored(new Vector4(0.4f, 1f, 0.4f, 1f), "(custom center active)");
+                else
+                    ImGui.TextColored(new Vector4(1f, 0.8f, 0.2f, 1f), "(using default 100, 100)");
+
+                ImGui.Spacing();
+
+                ImGui.SetNextItemWidth(110);
+                ImGui.InputFloat("X##cx", ref _editX, 0f, 0f, "%.2f");
+                ImGui.SameLine();
+                ImGui.SetNextItemWidth(110);
+                ImGui.InputFloat("Z##cz", ref _editZ, 0f, 0f, "%.2f");
+                ImGui.SameLine();
+                if (ImGui.Button("Save##savecenter"))
+                {
+                    _config.CustomCenters[territory] = new ArenaCenter { X = _editX, Z = _editZ };
+                    _config.Save();
+                }
+                if (hasCustom)
+                {
+                    ImGui.SameLine();
+                    if (ImGui.Button("Reset##resetcenter"))
+                    {
+                        _config.CustomCenters.Remove(territory);
+                        _editX = 100f;
+                        _editZ = 100f;
+                        _config.Save();
+                    }
+                    Tooltip("Remove custom center and revert to default (100, 100).");
+                }
+
+                ImGui.Spacing();
+
+                if (ImGui.Button("Use my position"))
+                {
+                    var pos = _plugin.GetPlayerFlatPosition();
+                    if (pos.HasValue) { _editX = pos.Value.X; _editZ = pos.Value.Z; }
+                }
+                Tooltip("Fill X/Z fields with your current in-game position.");
+                ImGui.SameLine();
+                if (ImGui.Button("Use Eos position"))
+                {
+                    var pos = _plugin.GetEosFlatPosition();
+                    if (pos.HasValue) { _editX = pos.Value.X; _editZ = pos.Value.Z; }
+                }
+                Tooltip("Fill X/Z fields with Eos's current position.");
+            }
+
+            // ── Saved centers list ────────────────────────────────────────────
+            if (_config.CustomCenters.Count > 0)
+            {
+                ImGui.Spacing();
+                ImGui.Separator();
+                ImGui.TextDisabled("Saved custom centers:");
+                uint? toDelete = null;
+                foreach (var (tid, center) in _config.CustomCenters)
+                {
+                    ImGui.Text($"  Territory {tid}:  X = {center.X:F2}   Z = {center.Z:F2}");
+                    ImGui.SameLine();
+                    if (ImGui.Button($"Delete##{tid}"))
+                        toDelete = tid;
+                }
+                if (toDelete.HasValue)
+                { _config.CustomCenters.Remove(toDelete.Value); _config.Save(); }
+            }
         }
     }
 

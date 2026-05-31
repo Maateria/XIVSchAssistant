@@ -4,6 +4,13 @@ using Dalamud.Plugin;
 namespace XIVSchAssitant;
 
 [Serializable]
+public class ArenaCenter
+{
+    public float X { get; set; } = 100f;
+    public float Z { get; set; } = 100f;
+}
+
+[Serializable]
 public class Configuration : IPluginConfiguration
 {
     public int Version { get; set; } = 0;
@@ -19,6 +26,9 @@ public class Configuration : IPluginConfiguration
     // ── Chain Stratagem — Compte a rebours ────────────────────────────────────
     public bool CountdownOverlayEnabled { get; set; } = true;
     public bool CountdownSoundEnabled   { get; set; } = true;
+
+    // ── Custom arena centers (overrides par territoire) ───────────────────────
+    public Dictionary<uint, ArenaCenter> CustomCenters { get; set; } = new();
 
     [NonSerialized]
     private IDalamudPluginInterface? _pluginInterface;

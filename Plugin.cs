@@ -45,8 +45,15 @@ public sealed class Plugin : IDalamudPlugin
     // Seuil de distance (metres) en dessous duquel Eos est consideree "au centre"
     private const float PlacementThreshold = 3f;
 
-    // Exceptions d'arene : centre different de (100, 100) pour certains territoires
-    private static readonly Dictionary<uint, (float X, float Z)> ArenaExceptions = new();
+    // Territoires pour lesquels l'alerte "centre invalide" a deja ete envoyee (session courante).
+    private readonly HashSet<uint> _warnedDefaultCenterTerritories = new();
+
+    // ── Verification post-placement ───────────────────────────────────────────
+    // 2.5s apres un placement sans centre personnalise, on verifie qu'Eos a bien
+    // atteint les coords cibles. Si elle est encore loin, les coords etaient invalides.
+    private DateTime? _pendingCenterVerifyAt;
+    private Vector3   _pendingCenterVerifyTarget;
+    private uint      _pendingCenterVerifyTerritory;
 
     // ── Hook ZoneClient.SendPacket ────────────────────────────────────────────
     // Intercepte les paquets sortants pour injecter les coordonnees du centre
@@ -69,6 +76,7 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal IBuddyList               BuddyList       { get; init; } = null!;
     [PluginService] internal IDutyState               DutyState       { get; init; } = null!;
     [PluginService] internal ICommandManager          CommandManager  { get; init; } = null!;
+    [PluginService] internal IChatGui                 ChatGui         { get; init; } = null!;
 
     internal Configuration Config { get; }
 
@@ -283,6 +291,15 @@ public sealed class Plugin : IDalamudPlugin
         {
             _pendingPlaceEos = false;
             DoPlaceEos();
+        }
+
+        // ── Verification post-placement ───────────────────────────────────────
+        if (_pendingCenterVerifyAt.HasValue && DateTime.UtcNow >= _pendingCenterVerifyAt.Value)
+        {
+            var verifyTarget    = _pendingCenterVerifyTarget;
+            var verifyTerritory = _pendingCenterVerifyTerritory;
+            _pendingCenterVerifyAt = null;
+            VerifyEosCenterReached(verifyTarget, verifyTerritory);
         }
 
         // ── Detection acquisition de cible ────────────────────────────────────
@@ -511,7 +528,17 @@ public sealed class Plugin : IDalamudPlugin
     // le paquet reseau resultant. Appele depuis Framework.Update (_pendingPlaceEos).
     private unsafe void DoPlaceEos()
     {
-        var center = GetArenaCenter();
+        var territory = ClientState.TerritoryType;
+        var center    = GetArenaCenter();
+
+        // Planifier une verification 2.5s apres le placement (uniquement si pas de centre custom).
+        // VerifyEosCenterReached comparera la position d'Eos aux coords envoyees.
+        if (!Config.CustomCenters.ContainsKey(territory))
+        {
+            _pendingCenterVerifyAt        = DateTime.UtcNow.AddSeconds(2.5);
+            _pendingCenterVerifyTarget    = center;
+            _pendingCenterVerifyTerritory = territory;
+        }
 
         // Activer l'injection AVANT d'envoyer la commande chat.
         // OnSendPacket intercepte le paquet (opcode=0x0030, actionId=3) dans les ~4ms
@@ -641,8 +668,8 @@ public sealed class Plugin : IDalamudPlugin
             if (obj->OwnerId != playerId || obj->ObjectKind != ObjectKind.BattleNpc) continue;
 
             float cx = 100f, cz = 100f;
-            if (ArenaExceptions.TryGetValue(ClientState.TerritoryType, out var ex))
-            { cx = ex.X; cz = ex.Z; }
+            if (Config.CustomCenters.TryGetValue(ClientState.TerritoryType, out var customCenter))
+            { cx = customCenter.X; cz = customCenter.Z; }
 
             float dx   = obj->Position.X - cx;
             float dz   = obj->Position.Z - cz;
@@ -801,13 +828,79 @@ public sealed class Plugin : IDalamudPlugin
     private unsafe Vector3 GetArenaCenter()
     {
         float x = 100f, z = 100f;
-        if (ArenaExceptions.TryGetValue(ClientState.TerritoryType, out var ex))
-        { x = ex.X; z = ex.Z; }
+        if (Config.CustomCenters.TryGetValue(ClientState.TerritoryType, out var custom))
+        { x = custom.X; z = custom.Z; }
 
         var obj = GameObjectManager.Instance()->Objects.IndexSorted[0].Value;
         float y = obj != null ? obj->Position.Y : 0f;
 
         return new Vector3(x, y, z);
+    }
+
+    // ── Helpers pour ConfigWindow ─────────────────────────────────────────────
+
+    internal uint CurrentTerritoryType => ClientState.TerritoryType;
+
+    internal unsafe (float X, float Z)? GetPlayerFlatPosition()
+    {
+        var playerObj = GameObjectManager.Instance()->Objects.IndexSorted[0].Value;
+        if (playerObj == null) return null;
+        return (playerObj->Position.X, playerObj->Position.Z);
+    }
+
+    internal unsafe (float X, float Z)? GetEosFlatPosition()
+    {
+        var playerObj = GameObjectManager.Instance()->Objects.IndexSorted[0].Value;
+        if (playerObj == null) return null;
+        uint playerId = playerObj->EntityId;
+        for (var i = 1; i < 200; i++)
+        {
+            var o = GameObjectManager.Instance()->Objects.IndexSorted[i].Value;
+            if (o == null) continue;
+            if (o->OwnerId == playerId && o->ObjectKind == ObjectKind.BattleNpc)
+                return (o->Position.X, o->Position.Z);
+        }
+        return null;
+    }
+
+    // Verifie 2.5s apres un placement que Eos est bien arrivee aux coords cibles.
+    // Si elle est encore loin (>8m), les coordonnees etaient invalides pour cette arene
+    // et on affiche une alerte rouge dans le chat pour que le joueur configure un centre custom.
+    private unsafe void VerifyEosCenterReached(Vector3 expectedCenter, uint territory)
+    {
+        if (!Config.AutoPlaceEnabled) return;
+        // Si un centre custom existe maintenant (configure entre le placement et la verif), on ne warn pas.
+        if (Config.CustomCenters.ContainsKey(territory)) return;
+        // Une seule alerte par territoire par session.
+        if (!_warnedDefaultCenterTerritories.Add(territory)) return;
+
+        var playerObj = GameObjectManager.Instance()->Objects.IndexSorted[0].Value;
+        if (playerObj == null) return;
+        uint playerId = playerObj->EntityId;
+
+        for (var i = 1; i < 200; i++)
+        {
+            var obj = GameObjectManager.Instance()->Objects.IndexSorted[i].Value;
+            if (obj == null) continue;
+            if (obj->OwnerId != playerId || obj->ObjectKind != ObjectKind.BattleNpc) continue;
+
+            float dx   = obj->Position.X - expectedCenter.X;
+            float dz   = obj->Position.Z - expectedCenter.Z;
+            float dist = MathF.Sqrt(dx * dx + dz * dz);
+
+            if (dist > 8f)
+            {
+                Log.Warning(
+                    $"[XIVSchAssistant] Center verification failed for territory {territory}: " +
+                    $"Eos is {dist:F1}m from expected center ({expectedCenter.X:F1}, {expectedCenter.Z:F1}).");
+                ChatGui.PrintError(
+                    $"[XIVSchAssistant] ⚠ Arena center unreachable for territory {territory}! " +
+                    "Eos could not reach the default position (100, 100) — " +
+                    "this arena has a non-standard center. " +
+                    "Use /xivsch → Custom Arena Centers to configure the correct position.");
+            }
+            return;
+        }
     }
 
     // ── Alerte sonore DoT ─────────────────────────────────────────────────────
