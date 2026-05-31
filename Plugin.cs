@@ -48,21 +48,18 @@ public sealed class Plugin : IDalamudPlugin
     // Territoires pour lesquels l'alerte "centre invalide" a deja ete envoyee (session courante).
     private readonly HashSet<uint> _warnedDefaultCenterTerritories = new();
 
+    // ── Hook SendPacket (injection coordonnees placement) ─────────────────────
+    private unsafe delegate bool SendPacketDelegate(ZoneClient* self, nint packet, uint a3, uint a4, bool a5);
+    private Hook<SendPacketDelegate>? _sendPacketHook;
+    private bool    _interceptNextPlacePacket;
+    private Vector3 _pendingPlaceCenter;
+
     // ── Verification post-placement ───────────────────────────────────────────
     // 2.5s apres un placement sans centre personnalise, on verifie qu'Eos a bien
     // atteint les coords cibles. Si elle est encore loin, les coords etaient invalides.
     private DateTime? _pendingCenterVerifyAt;
     private Vector3   _pendingCenterVerifyTarget;
     private uint      _pendingCenterVerifyTerritory;
-
-    // ── Hook ZoneClient.SendPacket ────────────────────────────────────────────
-    // Intercepte les paquets sortants pour injecter les coordonnees du centre
-    // dans le paquet "Se placer" (opcode=0x0030, actionId=3).
-    // Le serveur recoit ainsi des coordonnees de destination explicites — equivalent
-    // a un clic reticule au sol sur le centre de l'arene.
-    private unsafe delegate bool SendPacketDelegate(
-        ZoneClient* self, nint packet, uint a3, uint a4, bool a5);
-    private Hook<SendPacketDelegate>? _sendPacketHook;
 
     // ── Services Dalamud ──────────────────────────────────────────────────────
     [PluginService] internal IDalamudPluginInterface  PluginInterface { get; init; } = null!;
@@ -71,12 +68,12 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal IFramework               Framework       { get; init; } = null!;
     [PluginService] internal IPluginLog               Log             { get; init; } = null!;
     [PluginService] internal IDataManager             Data            { get; init; } = null!;
-    [PluginService] internal IGameInteropProvider     GameInterop     { get; init; } = null!;
     [PluginService] internal ITargetManager           TargetMgr       { get; init; } = null!;
     [PluginService] internal IBuddyList               BuddyList       { get; init; } = null!;
     [PluginService] internal IDutyState               DutyState       { get; init; } = null!;
     [PluginService] internal ICommandManager          CommandManager  { get; init; } = null!;
     [PluginService] internal IChatGui                 ChatGui         { get; init; } = null!;
+    [PluginService] internal IGameInteropProvider     GameInterop     { get; init; } = null!;
 
     internal Configuration Config { get; }
 
@@ -105,21 +102,17 @@ public sealed class Plugin : IDalamudPlugin
     // Vrai quand un DoPlaceEos doit s'executer au prochain tick Framework.Update.
     private bool _pendingPlaceEos;
 
-    // ── Injection coords dans le paquet Se placer ─────────────────────────────
-    // Quand _interceptNextPlacePacket est vrai, le prochain paquet
-    // opcode=0x0030 + actionId=3 voit ses coords (+0x34 X / +0x38 Y / +0x3C Z)
-    // remplacees par _pendingPlaceCenter avant transmission au serveur.
-    private bool    _interceptNextPlacePacket;
-    private Vector3 _pendingPlaceCenter;
+    // ── Noms localises des actions pet ───────────────────────────────────────
+    // Charges depuis la feuille Excel "PetAction" dans la langue du client au demarrage.
+    private string _placePetActionName = "Se placer"; // fallback FR
 
+    // ── Fallback placement <me> pour boss dont la position est invalide ────────
+    // 200ms apres la commande <t>, si le hook n'a pas ete declenche, on essaie <me>.
+    private DateTime? _placeEosMeRetryAt;
 
     // ── Detection changements d'entite ────────────────────────────────────────
     private uint _lastTargetId;      // EntityId de la derniere cible joueur
     private uint _lastEosPetEntityId; // EntityId du dernier pet detecte (Eos/Seraph)
-
-    // ── Noms localises des actions pet ───────────────────────────────────────
-    // Charges depuis la feuille Excel "PetAction" dans la langue du client au demarrage.
-    private string _placePetActionName = "Se placer"; // fallback FR
 
     // ── Alerte DoT Biolysis ───────────────────────────────────────────────────
     private bool     _biolysisWasActive;            // etat du DoT au tick precedent
@@ -152,11 +145,6 @@ public sealed class Plugin : IDalamudPlugin
         {
             var ps = FFXIVClientStructs.FFXIV.Client.Game.UI.PlayerState.Instance();
             if (ps != null) currentJobId = ps->CurrentClassJobId;
-
-            _sendPacketHook = GameInterop.HookFromAddress<SendPacketDelegate>(
-                (nint)ZoneClient.MemberFunctionPointers.SendPacket,
-                OnSendPacket);
-            _sendPacketHook.Enable();
         }
 
         _windowSystem = new WindowSystem("XIVSchAssitant");
@@ -173,6 +161,15 @@ public sealed class Plugin : IDalamudPlugin
         // font "grand format" du jeu (barres HP, titres), ideal pour des chiffres.
         _countdownFont = PluginInterface.UiBuilder.FontAtlas.NewGameFontHandle(
             new GameFontStyle(GameFontFamily.TrumpGothic, 96f));
+
+        // Hook sur ZoneClient::SendPacket pour injecter les coordonnees du centre
+        // dans le paquet de placement d'Eos avant qu'il parte vers le serveur.
+        unsafe
+        {
+            _sendPacketHook = GameInterop.HookFromAddress<SendPacketDelegate>(
+                (nint)ZoneClient.MemberFunctionPointers.SendPacket, OnSendPacket);
+            _sendPacketHook.Enable();
+        }
 
         ClientState.Login            += OnLogin;
         ClientState.ClassJobChanged  += OnClassJobChanged;
@@ -192,7 +189,7 @@ public sealed class Plugin : IDalamudPlugin
         else
             Log.Information($"[XIVSchAssitant] Son charge : {_dotSoundPath}");
 
-        Log.Information("[XIVSchAssitant] Charge — hook ZoneClient.SendPacket actif.");
+        Log.Information("[XIVSchAssitant] Charge.");
     }
 
     // ── Commandes et config UI ────────────────────────────────────────────────
@@ -293,6 +290,19 @@ public sealed class Plugin : IDalamudPlugin
             DoPlaceEos();
         }
 
+        // ── Fallback placement <me> (boss dont la position est invalide) ─────────
+        // Si 200ms apres la commande <t> le hook n'a pas ete declenche, c'est que
+        // la commande a ete rejetee (Cible invalide). On tente alors <me>.
+        if (_placeEosMeRetryAt.HasValue && DateTime.UtcNow >= _placeEosMeRetryAt.Value)
+        {
+            _placeEosMeRetryAt = null;
+            if (_interceptNextPlacePacket) // hook toujours arme → <t> a echoue
+            {
+                Log.Information("[XIVSchAssitant] [Place] <t> rejete — fallback <me>.");
+                unsafe { TrySendPlaceCommandMe(); }
+            }
+        }
+
         // ── Verification post-placement ───────────────────────────────────────
         if (_pendingCenterVerifyAt.HasValue && DateTime.UtcNow >= _pendingCenterVerifyAt.Value)
         {
@@ -314,8 +324,7 @@ public sealed class Plugin : IDalamudPlugin
                     && isInEightPlayerContent && currentJobId == ScholarJobId)
                 {
                     Log.Information(
-                        $"[XIVSchAssitant] [TargetChange] Cible acquise (0x{newTargetId:X8}) " +
-                        "— repositionnement immediat.");
+                        $"[XIVSchAssitant] [TargetChange] Target acquired (0x{newTargetId:X8}) — repositioning.");
                     nextPeriodicCheck = DateTime.UtcNow;
                 }
             }
@@ -524,15 +533,16 @@ public sealed class Plugin : IDalamudPlugin
         _pendingPlaceEos = true;
     }
 
-    // Envoie "/petaction Se placer" avec injection des coordonnees du centre dans
-    // le paquet reseau resultant. Appele depuis Framework.Update (_pendingPlaceEos).
+    // Envoie "/petaction Se placer <t>" avec injection des coordonnees du centre dans
+    // le paquet reseau resultant. Si <t> est rejete (Cible invalide — boss hors arene),
+    // un fallback <me> est tente 200ms plus tard via OnFrameworkUpdate.
+    // Appele depuis Framework.Update (_pendingPlaceEos).
     private unsafe void DoPlaceEos()
     {
         var territory = ClientState.TerritoryType;
         var center    = GetArenaCenter();
 
         // Planifier une verification 2.5s apres le placement (uniquement si pas de centre custom).
-        // VerifyEosCenterReached comparera la position d'Eos aux coords envoyees.
         if (!Config.CustomCenters.ContainsKey(territory))
         {
             _pendingCenterVerifyAt        = DateTime.UtcNow.AddSeconds(2.5);
@@ -540,51 +550,62 @@ public sealed class Plugin : IDalamudPlugin
             _pendingCenterVerifyTerritory = territory;
         }
 
-        // Activer l'injection AVANT d'envoyer la commande chat.
-        // OnSendPacket intercepte le paquet (opcode=0x0030, actionId=3) dans les ~4ms
-        // et remplace les coords par celles du centre : le serveur place Eos exactement
-        // au centre, sans passer par le reticule de ciblage au sol.
+        // Armer le hook AVANT d'envoyer la commande : OnSendPacket intercepte le paquet
+        // opcode=0x0030 / actionId=3 dans les ~4ms et remplace X/Y/Z par le centre.
         _pendingPlaceCenter       = center;
         _interceptNextPlacePacket = true;
+        _placeEosMeRetryAt        = null; // reset d'un eventuel timer precedent
         SendPlaceChatCommand();
     }
 
     // ── Commandes chat ────────────────────────────────────────────────────────
 
+    // Envoie /petaction "Se placer" <t> via ProcessChatBoxEntry.
+    // Si la cible est absente, annule et differe.
+    // Si la cible est valide, arme le timer fallback <me> (200ms).
     private unsafe void SendPlaceChatCommand()
     {
-        var uiModule = FFXIVClientStructs.FFXIV.Client.UI.UIModule.Instance();
+        var uiModule = UIModule.Instance();
         if (uiModule == null) return;
         if (TargetMgr.Target == null)
         {
-            // "Se placer <me>" est rejete par le jeu — la commande necessite une cible ennemie.
-            // On annule l'injection et on attend : la detection d'acquisition de cible
-            // (OnFrameworkUpdate) declenchera un repositionnement immediat des que le
-            // joueur cible le boss.
             _interceptNextPlacePacket = false;
             Log.Debug("[XIVSchAssitant] [ChatCmd] Pas de cible — placement differe.");
             return;
         }
+        // Fallback <me> dans 200ms si le hook n'a pas ete declenche (→ <t> rejete).
+        _placeEosMeRetryAt = DateTime.UtcNow.AddMilliseconds(200);
         Log.Information($"[XIVSchAssitant] [ChatCmd] {_placePetActionName} <t>");
         var msg = new FFXIVClientStructs.FFXIV.Client.System.String.Utf8String(
             $@"/petaction ""{_placePetActionName}"" <t>");
         uiModule->ProcessChatBoxEntry(&msg, 0, false);
     }
 
+    // Fallback : tente /petaction "Se placer" <me> quand <t> a ete rejete.
+    // Le hook reste arme — s'il intercepte le paquet <me>, il injecte le centre.
+    // Si <me> est aussi rejete (necessiterait un ennemi ?), le hook reste arme
+    // jusqu'au prochain cycle de repositionnement (qui le resettera).
+    private unsafe void TrySendPlaceCommandMe()
+    {
+        var uiModule = UIModule.Instance();
+        if (uiModule == null) { _interceptNextPlacePacket = false; return; }
+        Log.Information($"[XIVSchAssitant] [ChatCmd] Fallback {_placePetActionName} <me>");
+        var msg = new FFXIVClientStructs.FFXIV.Client.System.String.Utf8String(
+            $@"/petaction ""{_placePetActionName}"" <me>");
+        uiModule->ProcessChatBoxEntry(&msg, 0, false);
+    }
+
     // ── Hook ZoneClient.SendPacket ────────────────────────────────────────────
     // Intercepte les paquets opcode=0x0030 / actionId=3 (Se placer).
     // Structure du paquet (commande pet, taille stockee a +0x00) :
-    //   +0x00 : uint  taille totale du buffer (ex: 298 = 0x12A)
+    //   +0x00 : uint  taille totale du buffer
     //   +0x08 : ushort opcode
     //   +0x24 : uint  actionId (3 = Se placer)
     //   +0x34 : float X destination
-    //   +0x38 : float Y destination (sol de l'arene = 0)
+    //   +0x38 : float Y destination
     //   +0x3C : float Z destination
-    // NB : a3=0 pour les commandes pet (la taille reelle est a +0x00, pas dans a3).
-    //      a5=True pour "Attendre" uniquement (Se placer a a5=False).
-
-    private unsafe bool OnSendPacket(
-        ZoneClient* self, nint packet, uint a3, uint a4, bool a5)
+    // NB : a5=True pour "Attendre" uniquement (Se placer a a5=False).
+    private unsafe bool OnSendPacket(ZoneClient* self, nint packet, uint a3, uint a4, bool a5)
     {
         if (_interceptNextPlacePacket && packet != nint.Zero)
         {
@@ -602,9 +623,10 @@ public sealed class Plugin : IDalamudPlugin
                             float origX = *(float*)(packet + 0x34);
                             float origZ = *(float*)(packet + 0x3C);
                             *(float*)(packet + 0x34) = _pendingPlaceCenter.X;
-                            *(float*)(packet + 0x38) = 0f;   // sol de l'arene
+                            *(float*)(packet + 0x38) = 0f;
                             *(float*)(packet + 0x3C) = _pendingPlaceCenter.Z;
                             _interceptNextPlacePacket = false;
+                            _placeEosMeRetryAt        = null; // annuler le fallback
                             Log.Information(
                                 $"[XIVSchAssitant] [PacketInject] " +
                                 $"({origX:F2},_,{origZ:F2}) → " +
@@ -615,7 +637,6 @@ public sealed class Plugin : IDalamudPlugin
             }
             catch { /* ne pas crasher sur pointeur invalide */ }
         }
-
         return _sendPacketHook!.Original(self, packet, a3, a4, a5);
     }
 
@@ -699,61 +720,6 @@ public sealed class Plugin : IDalamudPlugin
         _lastEosPetEntityId = 0;
         nextPeriodicCheck = DateTime.UtcNow.AddSeconds(1);
         Log.Debug("[XIVSchAssitant] Pet non trouve.");
-    }
-
-    // ── Noms localises PetAction ──────────────────────────────────────────────
-
-    // Struct minimal compatible Lumina pour lire la feuille "PetAction" brute.
-    // La feuille n'existe pas en tant que type genere dans Lumina.Excel.Sheets,
-    // mais ExcelModule accepte tout type implementant IExcelRow<T>.
-    // Structure de la feuille PetAction :
-    //   col 0  Name    string (localise — "Se placer" / "Place" / "Platzieren" / "配置")
-    //   col 1  ...     autres colonnes non utilisees ici
-    [Sheet("PetAction")]
-    private readonly struct PetActionRow(ExcelPage page, uint offset, uint row)
-        : IExcelRow<PetActionRow>
-    {
-        // Membres requis par IExcelRow<T> dans cette version de Lumina
-        public uint     RowId      => row;
-        public ExcelPage ExcelPage => page;
-        public uint     RowOffset  => offset;
-        // Colonne 0 : Name — chaine localisee du nom de l'action.
-        // ReadString(stringOffset, dataOffset) : lit l'offset de chaine situe
-        // a la position stringOffset dans la page, resout la chaine relative a dataOffset.
-        // Pour la colonne 0, stringOffset == dataOffset == offset.
-        public ReadOnlySeString Name => page.ReadString(offset, offset);
-        static PetActionRow IExcelRow<PetActionRow>.Create(
-            ExcelPage page, uint offset, uint row) => new(page, offset, row);
-    }
-
-    // Charge les noms localises "Se placer" et "Attendre" depuis les donnees
-    // Excel du jeu dans la langue du client. Si le chargement echoue (feuille
-    // absente, structure differente, etc.), les fallbacks FR restent actifs.
-    private void LoadPetActionNames()
-    {
-        try
-        {
-            var sheet = Data.GetExcelSheet<PetActionRow>(ClientState.ClientLanguage);
-            if (sheet == null)
-            {
-                Log.Warning("[XIVSchAssitant] PetAction sheet introuvable — fallback FR.");
-                return;
-            }
-
-            var placeName = sheet.GetRow(PlacePetActionId).Name.ToString();
-            if (!string.IsNullOrWhiteSpace(placeName))
-                _placePetActionName = placeName;
-
-            Log.Information(
-                $"[XIVSchAssitant] PetAction localise ({ClientState.ClientLanguage}) : " +
-                $"place='{_placePetActionName}'");
-        }
-        catch (Exception ex)
-        {
-            Log.Warning(
-                $"[XIVSchAssitant] PetAction lookup echoue : {ex.Message} " +
-                "— fallback FR actif.");
-        }
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -903,6 +869,53 @@ public sealed class Plugin : IDalamudPlugin
         }
     }
 
+    // ── Noms localises PetAction ──────────────────────────────────────────────
+
+    // Struct minimal compatible Lumina pour lire la feuille "PetAction" brute.
+    // La feuille n'existe pas en tant que type genere dans Lumina.Excel.Sheets,
+    // mais ExcelModule accepte tout type implementant IExcelRow<T>.
+    // Structure de la feuille PetAction :
+    //   col 0  Name    string (localise — "Se placer" / "Place" / "Platzieren" / "配置")
+    [Sheet("PetAction")]
+    private readonly struct PetActionRow(ExcelPage page, uint offset, uint row)
+        : IExcelRow<PetActionRow>
+    {
+        public uint      RowId      => row;
+        public ExcelPage ExcelPage  => page;
+        public uint      RowOffset  => offset;
+        // Colonne 0 : Name — chaine localisee du nom de l'action.
+        public ReadOnlySeString Name => page.ReadString(offset, offset);
+        static PetActionRow IExcelRow<PetActionRow>.Create(
+            ExcelPage page, uint offset, uint row) => new(page, offset, row);
+    }
+
+    // Charge le nom localise "Se placer" depuis les donnees Excel du jeu dans la
+    // langue du client. Fallback FR si le chargement echoue.
+    private void LoadPetActionNames()
+    {
+        try
+        {
+            var sheet = Data.GetExcelSheet<PetActionRow>(ClientState.ClientLanguage);
+            if (sheet == null)
+            {
+                Log.Warning("[XIVSchAssitant] PetAction sheet introuvable — fallback FR.");
+                return;
+            }
+            var placeName = sheet.GetRow(PlacePetActionId).Name.ToString();
+            if (!string.IsNullOrWhiteSpace(placeName))
+                _placePetActionName = placeName;
+            Log.Information(
+                $"[XIVSchAssitant] PetAction localise ({ClientState.ClientLanguage}) : " +
+                $"place='{_placePetActionName}'");
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(
+                $"[XIVSchAssitant] PetAction lookup echoue : {ex.Message} " +
+                "— fallback FR actif.");
+        }
+    }
+
     // ── Alerte sonore DoT ─────────────────────────────────────────────────────
 
     private void PlayDotAlert()
@@ -1016,13 +1029,13 @@ public sealed class Plugin : IDalamudPlugin
         _windowSystem.RemoveAllWindows();
         mciSendString("close xivschsnd", null, 0, nint.Zero);
         _countdownFont?.Dispose();
-        _sendPacketHook?.Dispose();
         PluginInterface.UiBuilder.Draw -= OnDraw;
         ClientState.Login            -= OnLogin;
         ClientState.ClassJobChanged  -= OnClassJobChanged;
         ClientState.TerritoryChanged -= OnTerritoryChanged;
         Framework.Update             -= OnFrameworkUpdate;
         DutyState.DutyWiped          -= OnDutyWiped;
+        _sendPacketHook?.Dispose();
         Log.Information("[XIVSchAssitant] Plugin decharge.");
     }
 }

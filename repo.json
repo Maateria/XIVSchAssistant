@@ -3,7 +3,7 @@
     "Author": "Maateria",
     "Name": "XIVSchAssitant",
     "InternalName": "XIVSchAssitant",
-    "AssemblyVersion": "1.2.0.0",
+    "AssemblyVersion": "1.3.0.0",
     "Description": "Automatic Scholar assistant: summons Eos on login, instance entry, and after wipes; repositions her to the arena center in 8-player raids; plays an alert when Biolysis falls off; and shows a countdown overlay when Chain Stratagem is coming off cooldown. Use /xivsch to open settings.",
     "ApplicableVersion": "any",
     "RepoUrl": "https://github.com/Maateria/XIVSchAssistant",
