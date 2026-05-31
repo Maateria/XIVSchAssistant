@@ -78,6 +78,10 @@ public sealed class Plugin : IDalamudPlugin
     // soit debout et hors chargement pour invoquer Eos.
     private bool      _pendingEosSummonAfterWipe;
     private DateTime? scheduledPlaceEos;
+    // Envoie "Attendre" 2s apres chaque "Se placer" pour verrouiller Eos au centre.
+    // Independant du check periodique pour garantir l'envoi meme si nextPeriodicCheck
+    // est court-circuite par DetectPetEntityChange ou l'acquisition de cible.
+    private DateTime? scheduledStayEos;
     // Verification differee qu'Eos est invoquee (login, swap job, entree en instance).
     // Utilise un delai pour laisser le jeu finir son chargement avant de tenter l'invocation.
     private DateTime? scheduledEosCheck;
@@ -256,6 +260,15 @@ public sealed class Plugin : IDalamudPlugin
         {
             scheduledPlaceEos = null;
             TryPlaceEos();
+        }
+
+        // ── Attendre planifie (apres Se placer) ───────────────────────────────
+        // Verrouille Eos au centre 2s apres chaque placement.
+        if (scheduledStayEos.HasValue && DateTime.UtcNow >= scheduledStayEos.Value)
+        {
+            scheduledStayEos = null;
+            SendStayCommand();
+            _lastStaySentAt = DateTime.UtcNow;
         }
 
         // ── Placement en attente ──────────────────────────────────────────────
@@ -505,6 +518,9 @@ public sealed class Plugin : IDalamudPlugin
         _pendingPlaceCenter       = center;
         _interceptNextPlacePacket = true;
         SendPlaceChatCommand();
+        // Planifier "Attendre" 2s apres le placement pour verrouiller Eos au centre.
+        // Evite qu'elle reparte en mode "suivre" entre le placement et le prochain check periodique.
+        scheduledStayEos = DateTime.UtcNow.AddSeconds(2.0);
     }
 
     // ── Commandes chat ────────────────────────────────────────────────────────
