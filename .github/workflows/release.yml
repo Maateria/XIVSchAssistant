@@ -25,18 +25,16 @@ jobs:
       - name: Download Dalamud
         shell: pwsh
         run: |
-          Invoke-WebRequest -Uri "https://goatcorp.github.io/dalamud-distrib/latest.zip" -OutFile dalamud.zip
-          Expand-Archive -Path dalamud.zip -DestinationPath dalamud -Force
+          Invoke-WebRequest -Uri https://goatcorp.github.io/dalamud-distrib/latest.zip -OutFile latest.zip
+          Expand-Archive -Force latest.zip "$env:AppData\XIVLauncher\addon\Hooks\dev"
 
       - name: Build
-        env:
-          DALAMUD_LIB_PATH: ${{ github.workspace }}\dalamud
         run: dotnet build -c Release
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: bin/Release/net10.0-windows/XIVSchAssitant/latest.zip
+          files: bin/Release/XIVSchAssitant/latest.zip
           body: |
             **Work in progress** — XIVSchAssitant
 

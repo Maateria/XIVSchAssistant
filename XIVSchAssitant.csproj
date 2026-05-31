@@ -1,62 +1,19 @@
-<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Dalamud.NET.Sdk/15.0.0">
   <PropertyGroup>
-    <!-- Dalamud 15.x est compilé contre .NET 10 — le plugin doit cibler la même version -->
-    <TargetFramework>net10.0-windows</TargetFramework>
     <AssemblyName>XIVSchAssitant</AssemblyName>
     <RootNamespace>XIVSchAssitant</RootNamespace>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
-    <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <Optimize>true</Optimize>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Version>1.0.0</Version>
+    <PackageProjectUrl>https://github.com/Maateria/XIVSchAssistant</PackageProjectUrl>
   </PropertyGroup>
 
-  <!-- Pointe vers le dossier d'installation de Dalamud (XIVLauncher) -->
-  <PropertyGroup>
-    <DalamudLibPath>$(appdata)\XIVLauncher\addon\Hooks\dev\</DalamudLibPath>
-    <DalamudLibPath Condition="'$(DALAMUD_LIB_PATH)' != ''">$(DALAMUD_LIB_PATH)\</DalamudLibPath>
-  </PropertyGroup>
-
+  <!-- Fichier audio bundle avec le plugin -->
   <ItemGroup>
-    <PackageReference Include="DalamudPackager" Version="2.1.13" />
-  </ItemGroup>
-
-  <!-- Fichiers audio bundles avec le plugin -->
-  <ItemGroup>
-    <None Update="sound\Chocobo.wav">
+    <Content Include="sound\Chocobo.wav">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-    </None>
-  </ItemGroup>
-
-  <!-- DLLs Dalamud référencées localement — ne pas copier dans l'output -->
-  <ItemGroup>
-    <Reference Include="Dalamud">
-      <HintPath>$(DalamudLibPath)Dalamud.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="Dalamud.Bindings.ImGui">
-      <HintPath>$(DalamudLibPath)Dalamud.Bindings.ImGui.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="ImGuiScene">
-      <HintPath>$(DalamudLibPath)ImGuiScene.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="Lumina">
-      <HintPath>$(DalamudLibPath)Lumina.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="Lumina.Excel">
-      <HintPath>$(DalamudLibPath)Lumina.Excel.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="FFXIVClientStructs">
-      <HintPath>$(DalamudLibPath)FFXIVClientStructs.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="InteropGenerator.Runtime">
-      <HintPath>$(DalamudLibPath)InteropGenerator.Runtime.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
+    </Content>
   </ItemGroup>
 </Project>
