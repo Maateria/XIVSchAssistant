@@ -2,6 +2,7 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Game.ClientState.Objects.Types;
+using Dalamud.Game.DutyState;
 using Dalamud.Hooking;
 using Dalamud.IoC;
 using Dalamud.Plugin;
@@ -13,7 +14,9 @@ using FFXIVClientStructs.FFXIV.Client.UI;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.GameFonts;
 using Dalamud.Interface.ManagedFontAtlas;
+using Lumina.Excel;
 using Lumina.Excel.Sheets;
+using Lumina.Text.ReadOnly;
 
 namespace XIVSchAssitant;
 
@@ -25,6 +28,8 @@ public sealed class Plugin : IDalamudPlugin
 
     // Action "Se placer" : type=11 (pet action), id=3
     private const uint PlacePetActionId = 3;
+    // Action "Attendre" / "Stay" : id=2 dans la feuille PetAction
+    private const uint StayPetActionId  = 2;
 
     // Status effect "Biolysis" (Loi de l'infection) applique sur l'ennemi — ID 1895.
     private const uint BiolysisStatusId = 1895;
@@ -64,12 +69,14 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal IGameInteropProvider     GameInterop     { get; init; } = null!;
     [PluginService] internal ITargetManager           TargetMgr       { get; init; } = null!;
     [PluginService] internal IBuddyList               BuddyList       { get; init; } = null!;
+    [PluginService] internal IDutyState               DutyState       { get; init; } = null!;
 
     internal Configuration Config { get; }
 
     // ── Etat global ───────────────────────────────────────────────────────────
-    private bool      wasUnconscious;
-    private DateTime? scheduledResurrectionSummon;
+    // Vrai quand un DutyWiped vient d'etre detecte — en attente que le joueur
+    // soit debout et hors chargement pour invoquer Eos.
+    private bool      _pendingEosSummonAfterWipe;
     private DateTime? scheduledPlaceEos;
     // Verification differee qu'Eos est invoquee (login, swap job, entree en instance).
     // Utilise un delai pour laisser le jeu finir son chargement avant de tenter l'invocation.
@@ -102,6 +109,13 @@ public sealed class Plugin : IDalamudPlugin
     // ── Detection changements d'entite ────────────────────────────────────────
     private uint _lastTargetId;      // EntityId de la derniere cible joueur
     private uint _lastEosPetEntityId; // EntityId du dernier pet detecte (Eos/Seraph)
+
+    // ── Noms localises des actions pet ───────────────────────────────────────
+    // Charges depuis la feuille Excel "PetAction" dans la langue du client au demarrage.
+    // Utilises dans SendPlaceChatCommand / SendStayCommand pour que les commandes
+    // /petaction fonctionnent quelle que soit la langue du jeu (EN/FR/DE/JP).
+    private string _placePetActionName = "Se placer"; // fallback FR
+    private string _stayPetActionName  = "Attendre";  // fallback FR
 
     // ── Alerte DoT Biolysis ───────────────────────────────────────────────────
     private bool     _biolysisWasActive;            // etat du DoT au tick precedent
@@ -150,6 +164,10 @@ public sealed class Plugin : IDalamudPlugin
         ClientState.ClassJobChanged  += OnClassJobChanged;
         ClientState.TerritoryChanged += OnTerritoryChanged;
         Framework.Update             += OnFrameworkUpdate;
+        DutyState.DutyWiped          += OnDutyWiped;
+
+        // Charger les noms localises des actions pet depuis les donnees Excel du jeu.
+        LoadPetActionNames();
 
         // Chemin du fichier audio — copie dans le dossier du plugin via le .csproj.
         _dotSoundPath = Path.Combine(
@@ -165,11 +183,23 @@ public sealed class Plugin : IDalamudPlugin
 
     // ── Evenements ────────────────────────────────────────────────────────────
 
+    // Declenche quand tout le groupe est mort et que l'ecran passe au noir.
+    // Ne fire PAS sur un rez individuel en combat → detection fiable du wipe global.
+    private void OnDutyWiped(IDutyStateEventArgs args)
+    {
+        if (!Config.Enabled) return;
+        if (currentJobId != ScholarJobId) return;
+        Log.Information("[XIVSchAssitant] DutyWiped — Eos sera invoquee apres resurrection.");
+        _pendingEosSummonAfterWipe = true;
+    }
+
     private void OnTerritoryChanged(uint territoryType)
     {
         isInEightPlayerContent = IsEightPlayerContent(territoryType);
         Log.Debug($"[XIVSchAssitant] Territoire {territoryType} — 8j : {isInEightPlayerContent}");
-        if (isInEightPlayerContent) nextPeriodicCheck = DateTime.UtcNow.AddSeconds(5);
+        // Delai plus long pour laisser le temps au cercle bleu de se resoudre
+        // avant que le check periodique ne tente de repositionner Eos.
+        if (isInEightPlayerContent) nextPeriodicCheck = DateTime.UtcNow.AddSeconds(15);
 
         // Verifier qu'Eos est invoquee dans tout contenu instancie (donjon, trial, raid...).
         // Delai de 5s pour laisser l'instance finir de charger avant de tenter l'invocation.
@@ -200,19 +230,18 @@ public sealed class Plugin : IDalamudPlugin
         if (!Config.Enabled) return;
         if (!ClientState.IsLoggedIn) return;
 
-        // ── Resurrection ──────────────────────────────────────────────────────
-        bool isUnconscious = Condition[ConditionFlag.Unconscious];
-        if (wasUnconscious && !isUnconscious && currentJobId == ScholarJobId)
+        // ── Post-wipe : attente resurrection ─────────────────────────────────────
+        // DutyWiped a ete detecte (OnDutyWiped) — on attend que le joueur soit
+        // debout et hors chargement (Unconscious=false, BetweenAreas*=false)
+        // avant de planifier l'invocation d'Eos.
+        if (_pendingEosSummonAfterWipe
+            && !Condition[ConditionFlag.Unconscious]
+            && !Condition[ConditionFlag.BetweenAreas]
+            && !Condition[ConditionFlag.BetweenAreas51])
         {
-            Log.Information("[XIVSchAssitant] Resurrection — invocation d'Eos programmee.");
-            scheduledResurrectionSummon = DateTime.UtcNow.AddSeconds(Config.ResurrectionDelaySeconds);
-        }
-        wasUnconscious = isUnconscious;
-
-        if (scheduledResurrectionSummon.HasValue && DateTime.UtcNow >= scheduledResurrectionSummon.Value)
-        {
-            scheduledResurrectionSummon = null;
-            if (currentJobId == ScholarJobId) TrySummonEos();
+            _pendingEosSummonAfterWipe = false;
+            Log.Information("[XIVSchAssitant] Post-wipe — joueur operationnel, invocation Eos dans 2.5s.");
+            scheduledEosCheck = DateTime.UtcNow.AddSeconds(2.5);
         }
 
         // ── Verification Eos invoquee (login / swap job / entree instance) ───────
@@ -449,6 +478,17 @@ public sealed class Plugin : IDalamudPlugin
             Log.Warning("[XIVSchAssitant] TryPlaceEos — pet non trouve.");
             return;
         }
+        // Ne pas envoyer la commande pendant le chargement ou le cercle bleu
+        // (phase "instance chargee, pas encore demarree").
+        // BetweenAreas   = ecran de chargement principal.
+        // BetweenAreas51 = etat secondaire couvrant la phase cercle bleu / ready-check.
+        if (Condition[ConditionFlag.BetweenAreas] || Condition[ConditionFlag.BetweenAreas51])
+        {
+            Log.Debug("[XIVSchAssitant] TryPlaceEos — chargement/cercle bleu detecte, retry dans 2s.");
+            if (!scheduledPlaceEos.HasValue)
+                scheduledPlaceEos = DateTime.UtcNow.AddSeconds(2.0);
+            return;
+        }
         _pendingPlaceEos = true;
     }
 
@@ -477,16 +517,16 @@ public sealed class Plugin : IDalamudPlugin
         // Fallback <me> si aucune cible (debut d'instance, hors combat).
         if (TargetMgr.Target != null)
         {
-            Log.Information("[XIVSchAssitant] [ChatCmd] Se placer <t>");
+            Log.Information($"[XIVSchAssitant] [ChatCmd] {_placePetActionName} <t>");
             var msg = new FFXIVClientStructs.FFXIV.Client.System.String.Utf8String(
-                @"/petaction ""Se placer"" <t>");
+                $@"/petaction ""{_placePetActionName}"" <t>");
             uiModule->ProcessChatBoxEntry(&msg, 0, false);
         }
         else
         {
-            Log.Information("[XIVSchAssitant] [ChatCmd] Se placer <me>");
+            Log.Information($"[XIVSchAssitant] [ChatCmd] {_placePetActionName} <me>");
             var msg = new FFXIVClientStructs.FFXIV.Client.System.String.Utf8String(
-                @"/petaction ""Se placer"" <me>");
+                $@"/petaction ""{_placePetActionName}"" <me>");
             uiModule->ProcessChatBoxEntry(&msg, 0, false);
         }
     }
@@ -495,9 +535,9 @@ public sealed class Plugin : IDalamudPlugin
     {
         var uiModule = FFXIVClientStructs.FFXIV.Client.UI.UIModule.Instance();
         if (uiModule == null) return;
-        Log.Information("[XIVSchAssitant] [ChatCmd] Attendre <me>");
+        Log.Information($"[XIVSchAssitant] [ChatCmd] {_stayPetActionName} <me>");
         var msg = new FFXIVClientStructs.FFXIV.Client.System.String.Utf8String(
-            @"/petaction ""Attendre"" <me>");
+            $@"/petaction ""{_stayPetActionName}"" <me>");
         uiModule->ProcessChatBoxEntry(&msg, 0, false);
     }
 
@@ -624,10 +664,11 @@ public sealed class Plugin : IDalamudPlugin
             }
 
             // Eos hors centre : repositionnement.
-            // Intervalle court (1s) si pas de cible, pour reagir vite a l'acquisition du boss.
-            double interval = (_lastTargetId == 0) ? 1.0 : 5.0;
+            // Intervalle fixe 5s entre tentatives — evite le spam de commandes.
+            // (La detection d'acquisition de cible declenche un check immediat
+            //  via nextPeriodicCheck = DateTime.UtcNow dans OnFrameworkUpdate.)
             Log.Debug($"[XIVSchAssitant] Eos hors centre (dist={dist:F1}) — repositionnement.");
-            nextPeriodicCheck = DateTime.UtcNow.AddSeconds(interval);
+            nextPeriodicCheck = DateTime.UtcNow.AddSeconds(5.0);
             TryPlaceEos();
             return;
         }
@@ -636,6 +677,65 @@ public sealed class Plugin : IDalamudPlugin
         _lastEosPetEntityId = 0;
         nextPeriodicCheck = DateTime.UtcNow.AddSeconds(1);
         Log.Debug("[XIVSchAssitant] Pet non trouve.");
+    }
+
+    // ── Noms localises PetAction ──────────────────────────────────────────────
+
+    // Struct minimal compatible Lumina pour lire la feuille "PetAction" brute.
+    // La feuille n'existe pas en tant que type genere dans Lumina.Excel.Sheets,
+    // mais ExcelModule accepte tout type implementant IExcelRow<T>.
+    // Structure de la feuille PetAction :
+    //   col 0  Name    string (localise — "Se placer" / "Place" / "Platzieren" / "配置")
+    //   col 1  ...     autres colonnes non utilisees ici
+    [Sheet("PetAction")]
+    private readonly struct PetActionRow(ExcelPage page, uint offset, uint row)
+        : IExcelRow<PetActionRow>
+    {
+        // Membres requis par IExcelRow<T> dans cette version de Lumina
+        public uint     RowId      => row;
+        public ExcelPage ExcelPage => page;
+        public uint     RowOffset  => offset;
+        // Colonne 0 : Name — chaine localisee du nom de l'action.
+        // ReadString(stringOffset, dataOffset) : lit l'offset de chaine situe
+        // a la position stringOffset dans la page, resout la chaine relative a dataOffset.
+        // Pour la colonne 0, stringOffset == dataOffset == offset.
+        public ReadOnlySeString Name => page.ReadString(offset, offset);
+        static PetActionRow IExcelRow<PetActionRow>.Create(
+            ExcelPage page, uint offset, uint row) => new(page, offset, row);
+    }
+
+    // Charge les noms localises "Se placer" et "Attendre" depuis les donnees
+    // Excel du jeu dans la langue du client. Si le chargement echoue (feuille
+    // absente, structure differente, etc.), les fallbacks FR restent actifs.
+    private void LoadPetActionNames()
+    {
+        try
+        {
+            var sheet = Data.GetExcelSheet<PetActionRow>(ClientState.ClientLanguage);
+            if (sheet == null)
+            {
+                Log.Warning("[XIVSchAssitant] PetAction sheet introuvable — fallback FR.");
+                return;
+            }
+
+            var placeName = sheet.GetRow(PlacePetActionId).Name.ToString();
+            if (!string.IsNullOrWhiteSpace(placeName))
+                _placePetActionName = placeName;
+
+            var stayName = sheet.GetRow(StayPetActionId).Name.ToString();
+            if (!string.IsNullOrWhiteSpace(stayName))
+                _stayPetActionName = stayName;
+
+            Log.Information(
+                $"[XIVSchAssitant] PetAction localise ({ClientState.ClientLanguage}) : " +
+                $"place='{_placePetActionName}', stay='{_stayPetActionName}'");
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(
+                $"[XIVSchAssitant] PetAction lookup echoue : {ex.Message} " +
+                "— fallback FR actif.");
+        }
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -830,6 +930,7 @@ public sealed class Plugin : IDalamudPlugin
         ClientState.ClassJobChanged  -= OnClassJobChanged;
         ClientState.TerritoryChanged -= OnTerritoryChanged;
         Framework.Update             -= OnFrameworkUpdate;
+        DutyState.DutyWiped          -= OnDutyWiped;
         Log.Information("[XIVSchAssitant] Plugin decharge.");
     }
 }
