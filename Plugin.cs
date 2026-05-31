@@ -44,6 +44,7 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal IDataManager             Data            { get; init; } = null!;
     [PluginService] internal IGameInteropProvider     GameInterop     { get; init; } = null!;
     [PluginService] internal ITargetManager           TargetMgr       { get; init; } = null!;
+    [PluginService] internal IBuddyList               BuddyList       { get; init; } = null!;
 
     internal Configuration Config { get; }
 
@@ -51,6 +52,15 @@ public sealed class Plugin : IDalamudPlugin
     private bool      wasUnconscious;
     private DateTime? scheduledResurrectionSummon;
     private DateTime? scheduledPlaceEos;
+    // Verification differee qu'Eos est invoquee (login, swap job, entree en instance).
+    // Utilise un delai pour laisser le jeu finir son chargement avant de tenter l'invocation.
+    private DateTime? scheduledEosCheck;
+    // Pour le swap de job : reproduction exacte de PandorasBox/AutoFairy.
+    // Delai initial 100ms → chaque frame : BuddyList.PetBuddy?/GetActionStatus==0 → UseAction.
+    // Timeout 5s. Pas de delai fixe : invocation au plus tot que le jeu le permet.
+    private bool     _waitingForAmReady;    // true = poller AM chaque frame
+    private DateTime _waitingForAmStart;    // ne commencer a poller qu'apres ce temps
+    private DateTime _amReadyTimeout;       // abandon apres cette date
     private uint      currentJobId;
     private bool      isInEightPlayerContent;
     private DateTime  nextPeriodicCheck = DateTime.MinValue;
@@ -93,6 +103,7 @@ public sealed class Plugin : IDalamudPlugin
             _sendPacketHook.Enable();
         }
 
+        ClientState.Login            += OnLogin;
         ClientState.ClassJobChanged  += OnClassJobChanged;
         ClientState.TerritoryChanged += OnTerritoryChanged;
         Framework.Update             += OnFrameworkUpdate;
@@ -107,16 +118,28 @@ public sealed class Plugin : IDalamudPlugin
         isInEightPlayerContent = IsEightPlayerContent(territoryType);
         Log.Debug($"[XIVSchAssitant] Territoire {territoryType} — 8j : {isInEightPlayerContent}");
         if (isInEightPlayerContent) nextPeriodicCheck = DateTime.UtcNow.AddSeconds(5);
+
+        // Verifier qu'Eos est invoquee dans tout contenu instancie (donjon, trial, raid...).
+        // Delai de 5s pour laisser l'instance finir de charger avant de tenter l'invocation.
+        if (Config.Enabled && IsAnyInstanceContent(territoryType))
+        {
+            Log.Debug($"[XIVSchAssitant] Entree instance — verification Eos dans 5s.");
+            scheduledEosCheck = DateTime.UtcNow.AddSeconds(5);
+        }
     }
 
     private void OnClassJobChanged(uint classJobId)
     {
         currentJobId = classJobId;
         if (!Config.Enabled) return;
+        // Ne pas declencher pendant un changement de zone (identique a PandorasBox).
+        if (Condition[ConditionFlag.BetweenAreas]) return;
         if (classJobId == ScholarJobId)
         {
-            Log.Information("[XIVSchAssitant] Swap vers Erudit — invocation d'Eos.");
-            TrySummonEos();
+            Log.Information("[XIVSchAssitant] Swap vers Erudit — demarrage polling AM.");
+            _waitingForAmReady = true;
+            _waitingForAmStart = DateTime.UtcNow.AddMilliseconds(100); // delai initial 100ms (PandorasBox default ThrottleF)
+            _amReadyTimeout    = DateTime.UtcNow.AddSeconds(5);        // timeout 5s (PandorasBox EnqueueWithTimeout)
         }
     }
 
@@ -138,6 +161,13 @@ public sealed class Plugin : IDalamudPlugin
         {
             scheduledResurrectionSummon = null;
             if (currentJobId == ScholarJobId) TrySummonEos();
+        }
+
+        // ── Verification Eos invoquee (login / swap job / entree instance) ───────
+        if (scheduledEosCheck.HasValue && DateTime.UtcNow >= scheduledEosCheck.Value)
+        {
+            scheduledEosCheck = null;
+            CheckAndSummonEos();
         }
 
         // ── Placement planifie (apres invocation) ─────────────────────────────
@@ -176,6 +206,52 @@ public sealed class Plugin : IDalamudPlugin
             }
         }
 
+        // ── Attente ActionManager pret (swap de job vers Erudit) ─────────────
+        // Reproduction exacte de PandorasBox/AutoFairy TrySummon + TaskManager :
+        //   1. Attente initiale 100ms (_waitingForAmStart)
+        //   2. Chaque frame : BuddyList.PetBuddy != null → deja la, stop
+        //   3.                GetActionStatus(SummonEos) != 0 → pas pret, retry
+        //   4.                GetActionStatus(SummonEos) == 0 → UseAction, stop
+        //   5. Timeout 5s → abandon
+        if (_waitingForAmReady && currentJobId == ScholarJobId)
+        {
+            if (DateTime.UtcNow < _waitingForAmStart)
+            {
+                // Attente initiale : ne rien faire (equiv. TaskManager.EnqueueDelay)
+            }
+            else if (DateTime.UtcNow >= _amReadyTimeout)
+            {
+                _waitingForAmReady = false;
+                Log.Warning("[XIVSchAssitant] Timeout attente AM — abandon.");
+            }
+            else if (BuddyList.PetBuddy != null)
+            {
+                // Pet deja present (equiv. TrySummon return true quand PetBuddy != null)
+                _waitingForAmReady = false;
+                Log.Debug("[XIVSchAssitant] AM polling — pet deja present.");
+            }
+            else
+            {
+                unsafe
+                {
+                    var am = ActionManager.Instance();
+                    if (am != null &&
+                        am->GetActionStatus(ActionType.Action, SummonEosActionId, 0xE0000000UL, true, true) == 0)
+                    {
+                        // AM pret : equiv. TrySummon → UseAction → return true
+                        _waitingForAmReady = false;
+                        am->UseAction(ActionType.Action, SummonEosActionId);
+                        Log.Information("[XIVSchAssitant] AM pret — Eos invoquee.");
+                        if (isInEightPlayerContent)
+                        {
+                            scheduledPlaceEos = DateTime.UtcNow.AddSeconds(PlaceEosDelay);
+                            Log.Information($"[XIVSchAssitant] Placement planifie dans {PlaceEosDelay}s.");
+                        }
+                    }
+                }
+            }
+        }
+
         // ── Detection swap Seraph / Eos ───────────────────────────────────────
         // Chaque frame : detecte tout changement d'entite pet (Dissipation, Seraphim).
         if (isInEightPlayerContent && currentJobId == ScholarJobId)
@@ -202,19 +278,55 @@ public sealed class Plugin : IDalamudPlugin
         }
     }
 
+    // Appele quand le joueur se connecte sur son personnage.
+    // Necessaire pour invoquer Eos si le perso est deja en Erudit au login.
+    private void OnLogin()
+    {
+        Log.Information("[XIVSchAssitant] Connexion detectee — verification Eos dans 5s.");
+        // Delai de 5s : le perso n'est pas completement charge au moment de l'evenement.
+        scheduledEosCheck = DateTime.UtcNow.AddSeconds(5);
+    }
+
+    // Verifie qu'Eos est invoquee et l'invoque si absente.
+    // Appele par les chemins differee (login, entree instance).
+    // Utilise BuddyList.PetBuddy comme PandorasBox/AutoFairy.
+    private unsafe void CheckAndSummonEos()
+    {
+        if (!Config.Enabled) return;
+        if (!ClientState.IsLoggedIn) return;
+
+        // Re-lire le job depuis PlayerState UNIQUEMENT si currentJobId n'est pas
+        // encore initialise (cas du login quand le plugin charge avant la connexion).
+        if (currentJobId == 0)
+        {
+            var ps = FFXIVClientStructs.FFXIV.Client.Game.UI.PlayerState.Instance();
+            if (ps != null) currentJobId = ps->CurrentClassJobId;
+        }
+
+        if (currentJobId != ScholarJobId) return;
+
+        // BuddyList.PetBuddy : API Dalamud, equivalent de Svc.Buddies.PetBuddy (PandorasBox).
+        if (BuddyList.PetBuddy != null)
+        {
+            Log.Debug("[XIVSchAssitant] [EosCheck] Pet deja present.");
+            return;
+        }
+
+        Log.Information("[XIVSchAssitant] [EosCheck] Pet absent — invocation.");
+        TrySummonEos();
+        if (!scheduledEosCheck.HasValue)
+            scheduledEosCheck = DateTime.UtcNow.AddSeconds(1);
+    }
+
     // ── Placement d'Eos ───────────────────────────────────────────────────────
 
-    private unsafe void TryPlaceEos()
+    private void TryPlaceEos()
     {
-        var playerObj = GameObjectManager.Instance()->Objects.IndexSorted[0].Value;
-        if (playerObj == null) return;
-
-        if (FindEosObject(playerObj->EntityId) == null)
+        if (BuddyList.PetBuddy == null)
         {
             Log.Warning("[XIVSchAssitant] TryPlaceEos — pet non trouve.");
             return;
         }
-
         _pendingPlaceEos = true;
     }
 
@@ -442,6 +554,37 @@ public sealed class Plugin : IDalamudPlugin
         return false;
     }
 
+    // Retourne true pour tout contenu instancie (donjon, trial, raid, criterion...).
+    // Utilise pour decider si on doit verifier la presence d'Eos a l'entree.
+    private bool IsAnyInstanceContent(uint territoryType)
+    {
+        if (territoryType == 0) return false;
+        try
+        {
+            var sheet = Data.GetExcelSheet<ContentFinderCondition>();
+            if (sheet == null) return false;
+            foreach (var row in sheet)
+            {
+                try
+                {
+                    if (row.TerritoryType.RowId == territoryType)
+                    {
+                        uint ct = row.ContentType.RowId;
+                        // ContentType: 2=Donjon, 3=Faille, 4=Trial, 5=Raid, 28=Criterion...
+                        // On exclut 0 (monde ouvert) et 6 (PvP).
+                        return ct > 0 && ct != 6;
+                    }
+                }
+                catch { }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warning($"[XIVSchAssitant] IsAnyInstanceContent: {ex.Message}");
+        }
+        return false;
+    }
+
     private unsafe Vector3 GetArenaCenter()
     {
         float x = 100f, z = 100f;
@@ -459,6 +602,7 @@ public sealed class Plugin : IDalamudPlugin
     public void Dispose()
     {
         _sendPacketHook?.Dispose();
+        ClientState.Login            -= OnLogin;
         ClientState.ClassJobChanged  -= OnClassJobChanged;
         ClientState.TerritoryChanged -= OnTerritoryChanged;
         Framework.Update             -= OnFrameworkUpdate;
