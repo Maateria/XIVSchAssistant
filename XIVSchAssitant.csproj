@@ -21,14 +21,21 @@
     <PackageReference Include="DalamudPackager" Version="2.1.13" />
   </ItemGroup>
 
+  <!-- Fichiers audio bundles avec le plugin -->
+  <ItemGroup>
+    <None Update="sound\Chocobo.wav">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
   <!-- DLLs Dalamud référencées localement — ne pas copier dans l'output -->
   <ItemGroup>
     <Reference Include="Dalamud">
       <HintPath>$(DalamudLibPath)Dalamud.dll</HintPath>
       <Private>false</Private>
     </Reference>
-    <Reference Include="ImGui.NET">
-      <HintPath>$(DalamudLibPath)ImGui.NET.dll</HintPath>
+    <Reference Include="Dalamud.Bindings.ImGui">
+      <HintPath>$(DalamudLibPath)Dalamud.Bindings.ImGui.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="ImGuiScene">

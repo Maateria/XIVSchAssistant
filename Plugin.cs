@@ -1,5 +1,7 @@
 using System.Numerics;
+using System.Runtime.InteropServices;
 using Dalamud.Game.ClientState.Conditions;
+using Dalamud.Game.ClientState.Objects.Types;
 using Dalamud.Hooking;
 using Dalamud.IoC;
 using Dalamud.Plugin;
@@ -7,6 +9,10 @@ using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Application.Network;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.Game.Object;
+using FFXIVClientStructs.FFXIV.Client.UI;
+using Dalamud.Bindings.ImGui;
+using Dalamud.Interface.GameFonts;
+using Dalamud.Interface.ManagedFontAtlas;
 using Lumina.Excel.Sheets;
 
 namespace XIVSchAssitant;
@@ -19,6 +25,19 @@ public sealed class Plugin : IDalamudPlugin
 
     // Action "Se placer" : type=11 (pet action), id=3
     private const uint PlacePetActionId = 3;
+
+    // Status effect "Biolysis" (Loi de l'infection) applique sur l'ennemi — ID 1895.
+    private const uint BiolysisStatusId = 1895;
+
+    // Spells pour l'alerte compte a rebours cooldown
+    private const uint ChainStratagemActionId   = 7436;  // Stratagemes Entrelaces (~120s CD)
+
+    // ── WinMM PlaySound (alerte sonore DoT) ──────────────────────────────────
+    // Lecture WAV asynchrone via l'API Windows, sans dependance externe.
+    [DllImport("winmm.dll", CharSet = CharSet.Auto)]
+    private static extern bool PlaySound(string? pszSound, nint hmod, uint fdwSound);
+    private const uint SND_FILENAME  = 0x00020000; // pszSound est un chemin de fichier
+    private const uint SND_ASYNC     = 0x0001;     // lecture non bloquante
 
     // Seuil de distance (metres) en dessous duquel Eos est consideree "au centre"
     private const float PlacementThreshold = 3f;
@@ -84,6 +103,24 @@ public sealed class Plugin : IDalamudPlugin
     private uint _lastTargetId;      // EntityId de la derniere cible joueur
     private uint _lastEosPetEntityId; // EntityId du dernier pet detecte (Eos/Seraph)
 
+    // ── Alerte DoT Biolysis ───────────────────────────────────────────────────
+    private bool     _biolysisWasActive;            // etat du DoT au tick precedent
+    private DateTime _lastDotAlertAt = DateTime.MinValue; // cooldown anti-spam
+    private string?  _dotSoundPath;                 // chemin vers Chocobo.wav
+
+    // ── Overlay compte a rebours local ───────────────────────────────────────
+    // Affiche un grand chiffre centre a l'ecran (5, 4, 3, 2, 1) avec son natif.
+    // Entierement local — aucun paquet reseau envoye.
+    // Police haute resolution chargee via FontAtlas pour eviter le pixelise.
+    private IFontHandle? _countdownFont;
+    private bool     _localCountdownActive;
+    private float    _localCountdownStartValue;
+    private DateTime _localCountdownStart;
+    private int      _localCountdownLastTick;   // dernier entier affiche (evite bips doubles)
+
+    // ── Etat alerte cooldown ──────────────────────────────────────────────────
+    private bool _csAlertFired;  // alerte CS deja declenchee pour le CD en cours
+
     // ─────────────────────────────────────────────────────────────────────────
 
     public Plugin()
@@ -103,10 +140,25 @@ public sealed class Plugin : IDalamudPlugin
             _sendPacketHook.Enable();
         }
 
+        PluginInterface.UiBuilder.Draw += OnDraw;
+        // Police haute resolution pour le countdown — TrumpGothicE est le
+        // font "grand format" du jeu (barres HP, titres), ideal pour des chiffres.
+        _countdownFont = PluginInterface.UiBuilder.FontAtlas.NewGameFontHandle(
+            new GameFontStyle(GameFontFamily.TrumpGothic, 96f));
+
         ClientState.Login            += OnLogin;
         ClientState.ClassJobChanged  += OnClassJobChanged;
         ClientState.TerritoryChanged += OnTerritoryChanged;
         Framework.Update             += OnFrameworkUpdate;
+
+        // Chemin du fichier audio — copie dans le dossier du plugin via le .csproj.
+        _dotSoundPath = Path.Combine(
+            PluginInterface.AssemblyLocation.Directory!.FullName,
+            "sound", "Chocobo.wav");
+        if (!File.Exists(_dotSoundPath))
+            Log.Warning($"[XIVSchAssitant] Son introuvable : {_dotSoundPath}");
+        else
+            Log.Information($"[XIVSchAssitant] Son charge : {_dotSoundPath}");
 
         Log.Information("[XIVSchAssitant] Charge — hook ZoneClient.SendPacket actif.");
     }
@@ -262,6 +314,76 @@ public sealed class Plugin : IDalamudPlugin
             && DateTime.UtcNow >= nextPeriodicCheck)
         {
             CheckAndRepositionEos();
+        }
+
+        // ── Alerte DoT Biolysis (Loi de l'infection) ─────────────────────────
+        // Detecte quand le DoT 30s tombe du boss et joue un son d'alerte.
+        // Actif uniquement si Scholar + en combat + option activee.
+        if (Config.DotAlertEnabled && currentJobId == ScholarJobId
+            && Condition[ConditionFlag.InCombat])
+        {
+            if (TargetMgr.Target is IBattleChara targetChara)
+            {
+                unsafe
+                {
+                    var playerObj = GameObjectManager.Instance()->Objects.IndexSorted[0].Value;
+                    if (playerObj != null)
+                    {
+                        // Cherche notre Biolysis sur la cible (SourceId == notre EntityId)
+                        bool biolysisActive = false;
+                        var localId = playerObj->EntityId;
+                        foreach (var s in targetChara.StatusList)
+                        {
+                            if (s.StatusId == BiolysisStatusId && s.SourceId == localId)
+                            { biolysisActive = true; break; }
+                        }
+
+                        // Transition actif → inactif : le DoT vient de tomber
+                        if (_biolysisWasActive && !biolysisActive)
+                            PlayDotAlert();
+
+                        _biolysisWasActive = biolysisActive;
+                    }
+                }
+            }
+            else
+            {
+                // Pas de cible valide (boss intangible, phase...) : reset sans alerter
+                _biolysisWasActive = false;
+            }
+        }
+        else
+        {
+            _biolysisWasActive = false;
+        }
+
+        // ── Alerte cooldown Chain Stratagem / Emergency Tactics ───────────────────
+        // 5 secondes avant que le skill revienne, declenche un compte a rebours natif
+        // local (non diffuse au groupe — ecriture directe dans la structure du timer).
+        // Pas de guard InCombat : on veut l'alerte meme entre deux pulls.
+        if (Config.CooldownAlertEnabled && currentJobId == ScholarJobId)
+            CheckCooldownAlert();
+
+        // ── Tick overlay compte a rebours ─────────────────────────────────────────
+        // Joue le son natif (UIGlobals) a chaque nouveau chiffre entier.
+        // L'affichage est gere dans OnDraw (UiBuilder.Draw).
+        if (_localCountdownActive)
+        {
+            float elapsed    = (float)(DateTime.UtcNow - _localCountdownStart).TotalSeconds;
+            float remaining  = _localCountdownStartValue - elapsed;
+            if (remaining <= 0f)
+            {
+                _localCountdownActive = false;
+            }
+            else
+            {
+                int tick = (int)Math.Ceiling(remaining);
+                if (tick < _localCountdownLastTick)
+                {
+                    _localCountdownLastTick = tick;
+                    unsafe { UIGlobals.PlaySoundEffect(48); }
+                }
+            }
         }
     }
 
@@ -597,11 +719,113 @@ public sealed class Plugin : IDalamudPlugin
         return new Vector3(x, y, z);
     }
 
+    // ── Alerte sonore DoT ─────────────────────────────────────────────────────
+
+    private void PlayDotAlert()
+    {
+        // Cooldown 3s : evite le spam si la detection oscille rapidement
+        if ((DateTime.UtcNow - _lastDotAlertAt).TotalSeconds < 3.0) return;
+        _lastDotAlertAt = DateTime.UtcNow;
+        Log.Debug("[XIVSchAssitant] [DotAlert] Biolysis tombe — lecture son.");
+        try
+        {
+            if (_dotSoundPath != null && File.Exists(_dotSoundPath))
+                PlaySound(_dotSoundPath, nint.Zero, SND_FILENAME | SND_ASYNC);
+            else
+                Log.Warning("[XIVSchAssitant] [DotAlert] Fichier son manquant.");
+        }
+        catch (Exception ex)
+        {
+            Log.Warning($"[XIVSchAssitant] [DotAlert] Erreur : {ex.Message}");
+        }
+    }
+
+    // ── Overlay compte a rebours et alertes cooldown ──────────────────────────
+
+    // Demarre le compte a rebours local : affichage ImGui + son natif chaque seconde.
+    // Entierement local — aucun paquet reseau envoye.
+    private void TriggerLocalCountdown(float seconds)
+    {
+        _localCountdownActive    = true;
+        _localCountdownStartValue = seconds;
+        _localCountdownStart     = DateTime.UtcNow;
+        _localCountdownLastTick  = (int)Math.Ceiling(seconds); // ex: 5
+        // Son du premier chiffre immediatement
+        unsafe { UIGlobals.PlaySoundEffect(48); }
+        Log.Information($"[XIVSchAssitant] [CooldownAlert] Compte a rebours {seconds:F1}s (overlay ImGui).");
+    }
+
+    // Rendu ImGui : grand chiffre jaune-or dessine directement sur la ForegroundDrawList.
+    // Pas de fenetre ImGui — aucun artefact de frame/padding, centrage pixel-perfect.
+    private void OnDraw()
+    {
+        if (!_localCountdownActive) return;
+        float elapsed   = (float)(DateTime.UtcNow - _localCountdownStart).TotalSeconds;
+        float remaining = _localCountdownStartValue - elapsed;
+        if (remaining <= 0f) { _localCountdownActive = false; return; }
+        // Police pas encore construite (premier(s) frame) : attendre.
+        if (_countdownFont?.Available != true) return;
+
+        int displayNum = (int)Math.Ceiling(remaining);
+        var text = displayNum.ToString();
+        var io   = ImGui.GetIO();
+
+        using (_countdownFont!.Push())
+        {
+            var sz  = ImGui.CalcTextSize(text);
+            var pos = new Vector2(
+                (io.DisplaySize.X - sz.X) * 0.5f,
+                io.DisplaySize.Y * 0.38f - sz.Y * 0.5f);
+            var dl = ImGui.GetForegroundDrawList();
+            // Ombre portee — lisibilite sur fond clair et fond sombre
+            dl.AddText(pos + new Vector2(3, 3),
+                ImGui.ColorConvertFloat4ToU32(new Vector4(0f, 0f, 0f, 0.7f)), text);
+            // Chiffre jaune-or
+            dl.AddText(pos,
+                ImGui.ColorConvertFloat4ToU32(new Vector4(1f, 0.85f, 0.1f, 1f)), text);
+        }
+    }
+
+    // Verifie CS et ET chaque frame en combat pour detecter la fenetre <=5s.
+    private unsafe void CheckCooldownAlert()
+    {
+        var am = ActionManager.Instance();
+        if (am == null) return;
+        CheckActionAlert(am, ChainStratagemActionId, ref _csAlertFired, "ChainStratagem");
+    }
+
+    // Verifie si <actionId> est a <=5s de revenir et declenche l'alerte si besoin.
+    private unsafe void CheckActionAlert(ActionManager* am, uint actionId, ref bool alertFired, string label)
+    {
+        int group = am->GetRecastGroup((int)ActionType.Action, actionId);
+        if (group < 0) return;
+
+        var detail = am->GetRecastGroupDetail(group);
+        if (detail == null) return;
+
+        if (!detail->IsActive)
+        {
+            // Skill disponible → reset le flag pour la prochaine utilisation
+            alertFired = false;
+            return;
+        }
+
+        float remaining = detail->Total - detail->Elapsed;
+        if (remaining <= 5.0f && remaining > 0.1f && !alertFired)
+        {
+            alertFired = true;
+            Log.Information($"[XIVSchAssitant] [CooldownAlert] {label} revient dans {remaining:F1}s — declenchement compte a rebours.");
+            TriggerLocalCountdown(remaining);
+        }
+    }
+
     // ── Dispose ───────────────────────────────────────────────────────────────
 
     public void Dispose()
     {
+        _countdownFont?.Dispose();
         _sendPacketHook?.Dispose();
+        PluginInterface.UiBuilder.Draw -= OnDraw;
         ClientState.Login            -= OnLogin;
         ClientState.ClassJobChanged  -= OnClassJobChanged;
         ClientState.TerritoryChanged -= OnTerritoryChanged;

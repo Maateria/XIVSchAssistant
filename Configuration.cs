@@ -10,4 +10,10 @@ public class Configuration : IPluginConfiguration
     public bool Enabled { get; set; } = true;
 
     public float ResurrectionDelaySeconds { get; set; } = 2.5f;
+
+    // Alerte sonore quand Biolysis (Loi de l'infection) tombe du boss.
+    public bool DotAlertEnabled { get; set; } = true;
+
+    // Compte a rebours local 5s avant que Chain Stratagem / Emergency Tactics revienne.
+    public bool CooldownAlertEnabled { get; set; } = true;
 }
