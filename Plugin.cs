@@ -28,8 +28,6 @@ public sealed class Plugin : IDalamudPlugin
 
     // Action "Se placer" : type=11 (pet action), id=3
     private const uint PlacePetActionId = 3;
-    // Action "Attendre" / "Stay" : id=2 dans la feuille PetAction
-    private const uint StayPetActionId  = 2;
 
     // Status effect "Biolysis" (Loi de l'infection) applique sur l'ennemi — ID 1895.
     private const uint BiolysisStatusId = 1895;
@@ -102,9 +100,6 @@ public sealed class Plugin : IDalamudPlugin
     private bool    _interceptNextPlacePacket;
     private Vector3 _pendingPlaceCenter;
 
-    // ── Verrou "Attendre" ─────────────────────────────────────────────────────
-    // Cooldown 25s pour eviter le spam de la commande "Attendre <me>".
-    private DateTime _lastStaySentAt = DateTime.MinValue;
 
     // ── Detection changements d'entite ────────────────────────────────────────
     private uint _lastTargetId;      // EntityId de la derniere cible joueur
@@ -112,10 +107,7 @@ public sealed class Plugin : IDalamudPlugin
 
     // ── Noms localises des actions pet ───────────────────────────────────────
     // Charges depuis la feuille Excel "PetAction" dans la langue du client au demarrage.
-    // Utilises dans SendPlaceChatCommand / SendStayCommand pour que les commandes
-    // /petaction fonctionnent quelle que soit la langue du jeu (EN/FR/DE/JP).
     private string _placePetActionName = "Se placer"; // fallback FR
-    private string _stayPetActionName  = "Attendre";  // fallback FR
 
     // ── Alerte DoT Biolysis ───────────────────────────────────────────────────
     private bool     _biolysisWasActive;            // etat du DoT au tick precedent
@@ -529,16 +521,6 @@ public sealed class Plugin : IDalamudPlugin
         uiModule->ProcessChatBoxEntry(&msg, 0, false);
     }
 
-    private unsafe void SendStayCommand()
-    {
-        var uiModule = FFXIVClientStructs.FFXIV.Client.UI.UIModule.Instance();
-        if (uiModule == null) return;
-        Log.Information($"[XIVSchAssitant] [ChatCmd] {_stayPetActionName} <me>");
-        var msg = new FFXIVClientStructs.FFXIV.Client.System.String.Utf8String(
-            $@"/petaction ""{_stayPetActionName}"" <me>");
-        uiModule->ProcessChatBoxEntry(&msg, 0, false);
-    }
-
     // ── Hook ZoneClient.SendPacket ────────────────────────────────────────────
     // Intercepte les paquets opcode=0x0030 / actionId=3 (Se placer).
     // Structure du paquet (commande pet, taille stockee a +0x00) :
@@ -650,14 +632,6 @@ public sealed class Plugin : IDalamudPlugin
             {
                 bool inCombat = Condition[ConditionFlag.InCombat];
                 nextPeriodicCheck = DateTime.UtcNow.AddSeconds(inCombat ? 2.0 : 5.0);
-                // Envoyer "Attendre <me>" periodiquement pour verrouiller Eos au centre.
-                // Cooldown 25s.
-                if ((DateTime.UtcNow - _lastStaySentAt).TotalSeconds > 25.0)
-                {
-                    Log.Information("[XIVSchAssitant] [Periodic] Eos au centre — Attendre.");
-                    SendStayCommand();
-                    _lastStaySentAt = DateTime.UtcNow;
-                }
                 return;
             }
 
@@ -720,13 +694,9 @@ public sealed class Plugin : IDalamudPlugin
             if (!string.IsNullOrWhiteSpace(placeName))
                 _placePetActionName = placeName;
 
-            var stayName = sheet.GetRow(StayPetActionId).Name.ToString();
-            if (!string.IsNullOrWhiteSpace(stayName))
-                _stayPetActionName = stayName;
-
             Log.Information(
                 $"[XIVSchAssitant] PetAction localise ({ClientState.ClientLanguage}) : " +
-                $"place='{_placePetActionName}', stay='{_stayPetActionName}'");
+                $"place='{_placePetActionName}'");
         }
         catch (Exception ex)
         {
