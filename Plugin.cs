@@ -1099,9 +1099,21 @@ public sealed class Plugin : IDalamudPlugin
                 }
                 else
                 {
-                    _manualOverrideActive = false;
-                    nextPeriodicCheck     = DateTime.UtcNow;
-                    Log.Information("[XIVSchAssitant] [Manual] Retour au centre demande.");
+                    // Verifier qu'une cible est presente avant de declencher le placement.
+                    // Sans cible, la commande pet sera differee indefiniment — on previent
+                    // l'utilisateur et on garde le bouton visible.
+                    if (TargetMgr.Target == null)
+                    {
+                        ChatGui.PrintError(
+                            "[XIVSchAssistant] No target selected — please target the boss first, then click again to return Eos to the arena center.");
+                        Log.Debug("[XIVSchAssitant] [Manual] Clic sans cible — bouton conserve.");
+                    }
+                    else
+                    {
+                        _manualOverrideActive = false;
+                        nextPeriodicCheck     = DateTime.UtcNow;
+                        Log.Information("[XIVSchAssitant] [Manual] Retour au centre demande.");
+                    }
                 }
                 _btnIsDragging = false;
             }

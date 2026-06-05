@@ -3,7 +3,7 @@
     "Author": "Maateria",
     "Name": "XIVSchAssitant",
     "InternalName": "XIVSchAssitant",
-    "AssemblyVersion": "1.4.0.0",
+    "AssemblyVersion": "1.4.1.0",
     "Description": "Automatic Scholar assistant: summons Eos on login, instance entry, and after wipes; repositions her to the arena center in 8-player raids; plays an alert when Biolysis falls off; and shows a countdown overlay when Chain Stratagem is coming off cooldown. Manual override: if you place Eos yourself during a fight, auto-repositioning pauses and a draggable button appears on screen to send her back to center on demand. Use /xivsch to open settings.",
     "ApplicableVersion": "any",
     "RepoUrl": "https://github.com/Maateria/XIVSchAssistant",
