@@ -30,6 +30,11 @@ public class Configuration : IPluginConfiguration
     // ── Custom arena centers (overrides par territoire) ───────────────────────
     public Dictionary<uint, ArenaCenter> CustomCenters { get; set; } = new();
 
+    // ── Position du bouton "Retour au centre" ─────────────────────────────────
+    // NaN = pas encore positionne par l'utilisateur (utilise le centre de l'ecran).
+    public float ReturnBtnX { get; set; } = float.NaN;
+    public float ReturnBtnY { get; set; } = float.NaN;
+
     [NonSerialized]
     private IDalamudPluginInterface? _pluginInterface;
 

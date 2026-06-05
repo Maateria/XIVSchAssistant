@@ -40,6 +40,39 @@ public sealed class ConfigWindow : Window
             if (ImGui.Checkbox("Auto-place at center", ref autoPlace))
             { _config.AutoPlaceEnabled = autoPlace; _config.Save(); }
             Tooltip("Repositions Eos to the arena center in 8-player raids. Triggers automatically when you target the boss.");
+
+            if (_config.AutoPlaceEnabled)
+            {
+                ImGui.Spacing();
+                ImGui.Indent(12f);
+                ImGui.TextColored(new Vector4(0.75f, 0.90f, 1.00f, 1f), "Manual override");
+                ImGui.TextWrapped(
+                    "If you manually reposition Eos during a raid, auto-repositioning pauses. " +
+                    "A placement target button (⊙) will appear on screen — click it to send Eos " +
+                    "back to the arena center and resume auto-placement. Drag it to position it " +
+                    "next to your pet action bar.");
+                ImGui.Spacing();
+
+                bool hasSavedPos = !float.IsNaN(_config.ReturnBtnX) && !float.IsNaN(_config.ReturnBtnY);
+                if (hasSavedPos)
+                {
+                    ImGui.TextDisabled($"Button saved at: ({_config.ReturnBtnX:F0}, {_config.ReturnBtnY:F0})");
+                    ImGui.SameLine();
+                    if (ImGui.SmallButton("Reset##btnpos"))
+                    {
+                        _config.ReturnBtnX = float.NaN;
+                        _config.ReturnBtnY = float.NaN;
+                        _config.Save();
+                        _plugin.ResetReturnBtnPos();
+                    }
+                    Tooltip("Move the button back to the center of the screen.");
+                }
+                else
+                {
+                    ImGui.TextDisabled("Button position: default (screen center).");
+                }
+                ImGui.Unindent(12f);
+            }
         }
 
         ImGui.Spacing();

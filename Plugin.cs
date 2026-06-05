@@ -74,6 +74,7 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] internal ICommandManager          CommandManager  { get; init; } = null!;
     [PluginService] internal IChatGui                 ChatGui         { get; init; } = null!;
     [PluginService] internal IGameInteropProvider     GameInterop     { get; init; } = null!;
+    [PluginService] internal IGameGui                 GameGui         { get; init; } = null!;
 
     internal Configuration Config { get; }
 
@@ -109,6 +110,14 @@ public sealed class Plugin : IDalamudPlugin
     // ── Fallback placement <me> pour boss dont la position est invalide ────────
     // 200ms apres la commande <t>, si le hook n'a pas ete declenche, on essaie <me>.
     private DateTime? _placeEosMeRetryAt;
+
+    // ── Override manuel ───────────────────────────────────────────────────────
+    // Vrai quand le joueur a place Eos manuellement — l'auto-recentrage est suspendu.
+    // Se remet a false quand le joueur clique "Retour au centre", change de territoire,
+    // ou qu'un wipe / swap de pet survient.
+    private bool    _manualOverrideActive;
+    private Vector2 _returnBtnPos  = new Vector2(-1f, -1f); // -1 = non initialise
+    private bool    _btnIsDragging = false;
 
     // ── Detection changements d'entite ────────────────────────────────────────
     private uint _lastTargetId;      // EntityId de la derniere cible joueur
@@ -153,6 +162,7 @@ public sealed class Plugin : IDalamudPlugin
         PluginInterface.UiBuilder.Draw += _windowSystem.Draw;
         PluginInterface.UiBuilder.Draw += OnDraw;
         PluginInterface.UiBuilder.OpenConfigUi += OnOpenConfigUi;
+        PluginInterface.UiBuilder.OpenMainUi   += OnOpenConfigUi;
         CommandManager.AddHandler("/xivsch", new CommandInfo(OnXivSchCommand)
         {
             HelpMessage = "Open XIVSchAssistant settings.",
@@ -218,10 +228,12 @@ public sealed class Plugin : IDalamudPlugin
         if (currentJobId != ScholarJobId) return;
         Log.Information("[XIVSchAssitant] DutyWiped — Eos sera invoquee apres resurrection.");
         _pendingEosSummonAfterWipe = true;
+        _manualOverrideActive = false; // apres wipe, retour au comportement auto
     }
 
     private void OnTerritoryChanged(uint territoryType)
     {
+        _manualOverrideActive = false; // nouvel environnement → auto-recentrage actif
         isInEightPlayerContent = IsEightPlayerContent(territoryType);
         Log.Debug($"[XIVSchAssitant] Territoire {territoryType} — 8j : {isInEightPlayerContent}");
         // Delai plus long pour laisser le temps au cercle bleu de se resoudre
@@ -607,7 +619,7 @@ public sealed class Plugin : IDalamudPlugin
     // NB : a5=True pour "Attendre" uniquement (Se placer a a5=False).
     private unsafe bool OnSendPacket(ZoneClient* self, nint packet, uint a3, uint a4, bool a5)
     {
-        if (_interceptNextPlacePacket && packet != nint.Zero)
+        if (packet != nint.Zero)
         {
             try
             {
@@ -620,17 +632,27 @@ public sealed class Plugin : IDalamudPlugin
                         uint pktActionId = *(uint*)(packet + 0x24);
                         if (pktActionId == PlacePetActionId)
                         {
-                            float origX = *(float*)(packet + 0x34);
-                            float origZ = *(float*)(packet + 0x3C);
-                            *(float*)(packet + 0x34) = _pendingPlaceCenter.X;
-                            *(float*)(packet + 0x38) = 0f;
-                            *(float*)(packet + 0x3C) = _pendingPlaceCenter.Z;
-                            _interceptNextPlacePacket = false;
-                            _placeEosMeRetryAt        = null; // annuler le fallback
-                            Log.Information(
-                                $"[XIVSchAssitant] [PacketInject] " +
-                                $"({origX:F2},_,{origZ:F2}) → " +
-                                $"({_pendingPlaceCenter.X:F2},0,{_pendingPlaceCenter.Z:F2})");
+                            if (_interceptNextPlacePacket)
+                            {
+                                // Placement initie par le plugin — injection des coords du centre.
+                                float origX = *(float*)(packet + 0x34);
+                                float origZ = *(float*)(packet + 0x3C);
+                                *(float*)(packet + 0x34) = _pendingPlaceCenter.X;
+                                *(float*)(packet + 0x38) = 0f;
+                                *(float*)(packet + 0x3C) = _pendingPlaceCenter.Z;
+                                _interceptNextPlacePacket = false;
+                                _placeEosMeRetryAt        = null;
+                                Log.Information(
+                                    $"[XIVSchAssitant] [PacketInject] " +
+                                    $"({origX:F2},_,{origZ:F2}) → " +
+                                    $"({_pendingPlaceCenter.X:F2},0,{_pendingPlaceCenter.Z:F2})");
+                            }
+                            else if (isInEightPlayerContent && Config.AutoPlaceEnabled)
+                            {
+                                // Placement manuel du joueur — suspendre l'auto-recentrage.
+                                _manualOverrideActive = true;
+                                Log.Information("[XIVSchAssitant] [Manual] Placement manuel — auto-recentrage suspendu.");
+                            }
                         }
                     }
                 }
@@ -670,6 +692,7 @@ public sealed class Plugin : IDalamudPlugin
             Log.Information(
                 $"[XIVSchAssitant] [PetChange] 0x{oldPetId:X8}→0x{newPetId:X8} " +
                 "— repositionnement immediat.");
+            _manualOverrideActive = false; // nouveau pet → retour au comportement auto
             nextPeriodicCheck = DateTime.UtcNow;
         }
     }
@@ -678,6 +701,13 @@ public sealed class Plugin : IDalamudPlugin
 
     private unsafe void CheckAndRepositionEos()
     {
+        // Placement manuel actif → ne pas repositionner automatiquement.
+        if (_manualOverrideActive)
+        {
+            nextPeriodicCheck = DateTime.UtcNow.AddSeconds(5.0);
+            return;
+        }
+
         var playerObj = GameObjectManager.Instance()->Objects.IndexSorted[0].Value;
         if (playerObj == null) return;
         var playerId = playerObj->EntityId;
@@ -812,6 +842,12 @@ public sealed class Plugin : IDalamudPlugin
         var playerObj = GameObjectManager.Instance()->Objects.IndexSorted[0].Value;
         if (playerObj == null) return null;
         return (playerObj->Position.X, playerObj->Position.Z);
+    }
+
+    // Remet la position du bouton "Retour au centre" a la valeur par defaut (centre ecran).
+    internal void ResetReturnBtnPos()
+    {
+        _returnBtnPos = new Vector2(-1f, -1f); // force reinitialisation au prochain Draw
     }
 
     internal unsafe (float X, float Z)? GetEosFlatPosition()
@@ -959,6 +995,12 @@ public sealed class Plugin : IDalamudPlugin
     // Pas de fenetre ImGui — aucun artefact de frame/padding, centrage pixel-perfect.
     private void OnDraw()
     {
+        // ── Bouton "Retour au centre" (override manuel actif) ─────────────────
+        if (_manualOverrideActive && Config.AutoPlaceEnabled
+            && isInEightPlayerContent && currentJobId == ScholarJobId
+            && ClientState.IsLoggedIn)
+            DrawReturnToCenterButton();
+
         if (!_localCountdownActive || !Config.CountdownOverlayEnabled) return;
         float elapsed   = (float)(DateTime.UtcNow - _localCountdownStart).TotalSeconds;
         float remaining = _localCountdownStartValue - elapsed;
@@ -984,6 +1026,131 @@ public sealed class Plugin : IDalamudPlugin
             dl.AddText(pos,
                 ImGui.ColorConvertFloat4ToU32(new Vector4(1f, 0.85f, 0.1f, 1f)), text);
         }
+    }
+
+    // Bouton draggable "Retour au centre" — meme taille que les boutons de la barre de
+    // familier (~46x46 px). Apparait au centre de l'ecran (40% Y) la premiere fois.
+    // Drag gere manuellement via InvisibleButton + io.MouseDelta : click gauche = action,
+    // maintien + mouvement = deplacement. Position persistee en config.
+    private void DrawReturnToCenterButton()
+    {
+        const float Btn = 46f;
+        var io = ImGui.GetIO();
+
+        // Initialisation de la position au premier appel.
+        // Si la config contient une valeur dans le bas de l'ecran (< 85% Y), c'est un
+        // reste de l'ancienne version — on ignore et on recentre.
+        if (_returnBtnPos.X < 0f)
+        {
+            bool savedOk = !float.IsNaN(Config.ReturnBtnX)
+                        && !float.IsNaN(Config.ReturnBtnY)
+                        && Config.ReturnBtnY < io.DisplaySize.Y * 0.85f;
+            _returnBtnPos = savedOk
+                ? new Vector2(Config.ReturnBtnX, Config.ReturnBtnY)
+                : new Vector2(io.DisplaySize.X * 0.5f - Btn * 0.5f,
+                              io.DisplaySize.Y * 0.4f - Btn * 0.5f);
+        }
+
+        // Clamp a l'ecran
+        _returnBtnPos = new Vector2(
+            Math.Clamp(_returnBtnPos.X, 0f, io.DisplaySize.X - Btn),
+            Math.Clamp(_returnBtnPos.Y, 0f, io.DisplaySize.Y - Btn));
+
+        // Fenetre positionnee manuellement (NoMove) — le drag est gere par InvisibleButton.
+        ImGui.SetNextWindowPos(_returnBtnPos, ImGuiCond.Always);
+        ImGui.SetNextWindowSize(new Vector2(Btn, Btn), ImGuiCond.Always);
+        ImGui.SetNextWindowBgAlpha(0f);
+
+        var wflags = ImGuiWindowFlags.NoTitleBar  | ImGuiWindowFlags.NoResize         |
+                     ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse |
+                     ImGuiWindowFlags.NoCollapse  | ImGuiWindowFlags.NoMove            |
+                     ImGuiWindowFlags.NoNav       | ImGuiWindowFlags.NoFocusOnAppearing;
+
+        ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding,   Vector2.Zero);
+        ImGui.PushStyleVar(ImGuiStyleVar.WindowBorderSize, 0f);
+
+        if (ImGui.Begin("##EosCenterReturn", wflags))
+        {
+            var origin = ImGui.GetCursorScreenPos();
+            var dl     = ImGui.GetWindowDrawList();
+
+            // Zone d'interaction couvrant toute la surface (drag ET click).
+            ImGui.InvisibleButton("##ibtn", new Vector2(Btn, Btn));
+            bool hovered  = ImGui.IsItemHovered();
+            bool active   = ImGui.IsItemActive();
+            bool released = ImGui.IsItemDeactivated();
+
+            // Drag : souris maintenue + deplacement > 3px
+            if (active && ImGui.IsMouseDragging(ImGuiMouseButton.Left, 3f))
+            {
+                _btnIsDragging = true;
+                _returnBtnPos += io.MouseDelta;
+            }
+
+            // Release : fin de drag (sauvegarde) ou clic simple (action)
+            if (released)
+            {
+                if (_btnIsDragging)
+                {
+                    Config.ReturnBtnX = _returnBtnPos.X;
+                    Config.ReturnBtnY = _returnBtnPos.Y;
+                    Config.Save();
+                    Log.Debug($"[XIVSchAssitant] [Btn] Pos sauvegardee ({_returnBtnPos.X:F0},{_returnBtnPos.Y:F0})");
+                }
+                else
+                {
+                    _manualOverrideActive = false;
+                    nextPeriodicCheck     = DateTime.UtcNow;
+                    Log.Information("[XIVSchAssitant] [Manual] Retour au centre demande.");
+                }
+                _btnIsDragging = false;
+            }
+
+            // Apparence : fond sombre type slot FFXIV, bordure bleue Scholar
+            uint colBg = active
+                ? ImGui.ColorConvertFloat4ToU32(new Vector4(0.04f, 0.22f, 0.58f, 1.00f))
+                : hovered
+                    ? ImGui.ColorConvertFloat4ToU32(new Vector4(0.15f, 0.40f, 0.78f, 0.97f))
+                    : ImGui.ColorConvertFloat4ToU32(new Vector4(0.08f, 0.08f, 0.16f, 0.92f));
+            uint colBd = ImGui.ColorConvertFloat4ToU32(new Vector4(0.50f, 0.72f, 1.00f, 0.85f));
+
+            dl.AddRectFilled(origin, origin + new Vector2(Btn, Btn), colBg, 4f);
+            dl.AddRect(origin, origin + new Vector2(Btn, Btn), colBd, 4f, 0, 1.5f);
+
+            // Icone "cible de placement" : cercle + reticule + point central.
+            // Symbolise clairement "placer Eos en ce point" (identique aux indicateurs
+            // de ciblage au sol de FFXIV).
+            var c  = origin + new Vector2(Btn * 0.5f, Btn * 0.5f); // centre du bouton
+            float rOuter = Btn * 0.34f; // rayon du cercle exterieur
+            float rDot   = Btn * 0.07f; // rayon du point central
+            float gap    = Btn * 0.11f; // espace entre le point et les branches du reticule
+            float alpha  = active ? 1.00f : hovered ? 0.95f : 0.88f;
+
+            // Couleur principale : bleu clair Scholar
+            uint colIcon = ImGui.ColorConvertFloat4ToU32(new Vector4(0.60f, 0.86f, 1.00f, alpha));
+            // Accent interieur : blanc pour le point central
+            uint colDot  = ImGui.ColorConvertFloat4ToU32(new Vector4(1.00f, 1.00f, 1.00f, alpha));
+
+            // Cercle exterieur
+            dl.AddCircle(c, rOuter, colIcon, 48, 1.8f);
+
+            // 4 branches du reticule (du bord interne du gap jusqu'au cercle)
+            float t1 = rDot + gap, t2 = rOuter - 1f;
+            dl.AddLine(c + new Vector2(0f,  -t1), c + new Vector2(0f,  -t2), colIcon, 1.8f);
+            dl.AddLine(c + new Vector2(0f,   t1), c + new Vector2(0f,   t2), colIcon, 1.8f);
+            dl.AddLine(c + new Vector2(-t1, 0f),  c + new Vector2(-t2, 0f),  colIcon, 1.8f);
+            dl.AddLine(c + new Vector2( t1, 0f),  c + new Vector2( t2, 0f),  colIcon, 1.8f);
+
+            // Point central plein (blanc pour contraster)
+            dl.AddCircleFilled(c, rDot, colDot);
+            // Petit anneau autour du point pour la lisibilite
+            dl.AddCircle(c, rDot + 2f, colIcon, 24, 1.2f);
+
+            if (hovered)
+                ImGui.SetTooltip("Return Eos to arena center\nDrag to reposition");
+        }
+        ImGui.End();
+        ImGui.PopStyleVar(2);
     }
 
     // Verifie CS et ET chaque frame en combat pour detecter la fenetre <=5s.
@@ -1025,6 +1192,7 @@ public sealed class Plugin : IDalamudPlugin
     {
         CommandManager.RemoveHandler("/xivsch");
         PluginInterface.UiBuilder.OpenConfigUi -= OnOpenConfigUi;
+        PluginInterface.UiBuilder.OpenMainUi   -= OnOpenConfigUi;
         PluginInterface.UiBuilder.Draw -= _windowSystem.Draw;
         _windowSystem.RemoveAllWindows();
         mciSendString("close xivschsnd", null, 0, nint.Zero);
